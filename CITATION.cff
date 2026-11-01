@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the MnemoRAG paper."
+title: "MnemoRAG: Exploiting Inter-Request Correlations for High-Performance RAG Serving"
+type: software
+version: 0.1.0
+date-released: 2026-10-31
+authors:
+  - family-names: "Yan"
+    given-names: "Xin"
+  - family-names: "Huang"
+    given-names: "Hang"
+  - family-names: "Huang"
+    given-names: "Zhuo"
+  - family-names: "Wu"
+    given-names: "Song"
+  - family-names: "Jin"
+    given-names: "Hai"
+repository-code: "https://github.com/Lemonandyx/MnemoRAG"
+license: MIT
+preferred-citation:
+  type: article
+  title: "MnemoRAG: Exploiting Inter-Request Correlations for High-Performance RAG Serving"
+  authors:
+    - family-names: "Yan"
+      given-names: "Xin"
+    - family-names: "Huang"
+      given-names: "Hang"
+    - family-names: "Huang"
+      given-names: "Zhuo"
+    - family-names: "Wu"
+      given-names: "Song"
+    - family-names: "Jin"
+      given-names: "Hai"

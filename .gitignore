@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+.DS_Store
+._*
+
+# Runtime assets and raw measurements
+data/
+models/
+indexes/
+output/
+results/
+backups/
+logs/
+*.log
+*.index
+*.memmap
+*.npy
+*.npz
+*.bin
+*.safetensors
+*.tgz
+*.tar.gz
+
+# Generated paper figures
+figures/generated/

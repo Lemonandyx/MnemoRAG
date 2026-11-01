@@ -1,0 +1,200 @@
+{
+  "schema": "mnemorag.six-system-replication-contract.v1",
+  "purpose": "Keep paper-native reproduction separate from a common-corpus fair comparison.",
+  "systems": [
+    "gptcache",
+    "qvcache",
+    "has",
+    "proximity",
+    "hedrarag",
+    "mnemorag"
+  ],
+  "source_roots": {
+    "gptcache": "${GPTCACHE_PYTHON}",
+    "qvcache": "${QVCACHE_ROOT}",
+    "has": "${HAS_ROOT}",
+    "proximity": "${PROXIMITY_ROOT}",
+    "hedrarag": "${HEDRARAG_ROOT}",
+    "mnemorag": "."
+  },
+  "native_paper": {
+    "gptcache": {
+      "reference": "https://github.com/zilliztech/GPTCache",
+      "implementation": "official GPTCache 0.1.44 package",
+      "canonical_paper_workload": null,
+      "required_evidence": [
+        "package version and source content hash",
+        "official semantic-cache API smoke test",
+        "explicit statement that no canonical six-system paper workload exists"
+      ],
+      "headline_eligible": false,
+      "reason": "GPTCache is a general semantic-cache framework; its adapted retrieval-result integration is not a paper-native ANN benchmark."
+    },
+    "qvcache": {
+      "reference": "https://arxiv.org/abs/2602.02057",
+      "implementation": "official C++ QVCache with Python bindings",
+      "datasets": {
+        "sift": {"vectors": 1000000000, "dimension": 128, "metric": "l2", "queries": 10000},
+        "spacev": {"vectors": 100000000, "dimension": 100, "metric": "l2", "queries": 29316},
+        "deep": {"vectors": 10000000, "dimension": 96, "metric": "l2", "queries": 10000},
+        "gist": {"vectors": 1000000, "dimension": 960, "metric": "l2", "queries": 1000},
+        "glove": {"vectors": 1000000, "dimension": 100, "metric": "cosine", "queries": 10000}
+      },
+      "workload": {
+        "n_split": 10,
+        "noise_ratio": 0.01,
+        "n_repeat": 3,
+        "window_size": 4,
+        "stride": 1,
+        "n_round": 1
+      },
+      "parameters": {
+        "k": 10,
+        "alpha": 0.9,
+        "buckets_per_dim": 8,
+        "pca_dim": 16,
+        "cache_capacity_vectors": 100000,
+        "mini_indexes": 4,
+        "search_strategy": "SEQUENTIAL_LRU_ADAPTIVE",
+        "deviation_factor_sift_spacev": 0.25,
+        "deviation_factor_other": 0.075
+      },
+      "hardware": "Intel Xeon Gold 5118, 24 physical cores, 376 GB DDR4, Dell PM1725a NVMe",
+      "metrics": ["window-step hit ratio", "hit latency", "p50 latency", "throughput", "10-recall@10", "memory"],
+      "headline_eligible": true
+    },
+    "has": {
+      "reference": "https://arxiv.org/abs/2604.20452",
+      "implementation": "official HaS two-channel speculative retriever",
+      "dataset": "49.2M Wikipedia passages plus popularity-augmented Granola-EQ and PopQA",
+      "parameters": {
+        "full_index": "Faiss IndexPQ",
+        "fuzzy_index": "Faiss IndexIVFPQ",
+        "fuzzy_nlist": 8192,
+        "fuzzy_nprobe": 64,
+        "cache_index": "HNSWLib",
+        "cache_query_capacity": 5000,
+        "eviction": "FIFO",
+        "cold_start": true,
+        "k": 10,
+        "homology_threshold": 0.2,
+        "cloud_network_latency_s": [0.1, 0.2],
+        "edge_network_latency_s": [0.01, 0.05]
+      },
+      "hardware": "Intel i9-13900KF plus RTX 3090",
+      "metrics": ["average retrieval latency", "response accuracy", "document hit rate", "RA@DA", "DAR", "CAR"],
+      "headline_eligible": true
+    },
+    "proximity": {
+      "reference": "https://arxiv.org/abs/2503.05530",
+      "implementation": "official Rust Proximity-FLAT and Proximity-LSH with PyO3 bindings",
+      "datasets": {
+        "mmlu_econometrics": {"queries": 131, "variants_per_query": 4, "corpus": "wiki_dpr 21M", "index": "Faiss HNSW", "embedding": "DPR 768d"},
+        "medrag_uniform": {"base_queries": 200, "queries": 800, "corpus": "PubMed 23.9M", "index": "Faiss Flat", "embedding": "MedCPT 768d"},
+        "medrag_zipf": {"base_queries": 500, "queries": 10000, "zipf": 0.8, "corpus": "PubMed 23.9M", "index": "Faiss Flat", "embedding": "MedCPT 768d"}
+      },
+      "parameters": {
+        "flat_capacity_sweep": [10, 50, 100, 200, 300],
+        "lsh_bucket_capacity": 20,
+        "lsh_primary_hash_bits": 8,
+        "medrag_zipf_reranking_factor": 4,
+        "repetitions": 5,
+        "seeds": "distinct per repetition"
+      },
+      "hardware": "12 cores of Intel Xeon Gold 6240 and 300 GB RAM per container",
+      "metrics": ["test accuracy", "cache hit rate", "retrieval latency", "database k-recall"],
+      "headline_eligible": true
+    },
+    "hedrarag": {
+      "reference": "https://arxiv.org/abs/2507.09138",
+      "implementation": "official AE heterogeneous CPU/GPU retriever",
+      "required_evidence": [
+        "unmodified official AE command and configuration",
+        "graph-transform and continuous-retrieval path enabled",
+        "hardware and dataset match the paper or are explicitly labeled as adapted"
+      ],
+      "headline_eligible": "only for an unmodified native-paper run"
+    },
+    "mnemorag": {
+      "reference": "local system under evaluation",
+      "implementation": "full MnemoRAG with query-base reuse, similarity-aware retrieval, current-batch scheduling and CPU-KV mechanisms",
+      "required_evidence": [
+        "action counts for exact, reuse, guided and full",
+        "effective probe-count distribution",
+        "stage-level latency",
+        "quality and resource evidence"
+      ],
+      "headline_eligible": true
+    }
+  },
+  "adapted_fair": {
+    "datasets": ["squad", "nq", "hotpotqa", "2wikimultihopqa"],
+    "requests_per_dataset": 512,
+    "arrival_process": "identical locked Poisson trace per dataset",
+    "arrival_rate_qps": 8,
+    "index": "wiki18 21M, E5-large-v2, Faiss IVF4096,Flat",
+    "configured_nprobe": 128,
+    "topk": 3,
+    "hardware": {
+      "gpu": "physical GPU1",
+      "cpu": "socket0 CPU0-63, 64 no-SMT physical cores",
+      "numa": "NUMA0-3, 16 cores each",
+      "binding": "numactl --physcpubind=0-63 --interleave=0-3"
+    },
+    "measurement": {
+      "primary_latency": "arrival-to-completion retrieval latency",
+      "required_components": [
+        "queue_wait",
+        "embedding",
+        "cache_lookup_or_similarity",
+        "coarse_quantizer",
+        "backend_search",
+        "rerank_or_validation",
+        "cache_update",
+        "document_materialization"
+      ],
+      "required_percentiles": [50, 95, 99],
+      "required_capacity_metrics": ["offered_qps", "achieved_qps", "service_capacity_qps", "utilization", "overloaded"],
+      "overload_rule": "A point is overloaded when offered_qps exceeds measured service_capacity_qps or the request backlog is nonstationary; overloaded points remain in raw results but cannot be used as an algorithm-only headline bar."
+    },
+    "quality": {
+      "reference": "same-query Faiss IVF4096,Flat at nprobe=128 and topk=3",
+      "metrics": ["Recall@3", "exact-result rate"],
+      "noninferiority_margin_absolute": 0.005
+    },
+    "fairness": [
+      "identical questions, order, arrival offsets and history rows within a dataset",
+      "identical encoder, corpus, index, top-k and configured nprobe",
+      "same document-materialization boundary",
+      "native cache admission and lookup algorithms remain enabled",
+      "no manually injected delay and no baseline-specific serialization",
+      "cold-start and warm-start results are reported separately",
+      "adaptive systems report actual backend probes or searched candidates"
+    ],
+    "headline_eligibility": {
+      "gptcache": "adapted-fair only",
+      "qvcache": "adapted-fair only",
+      "has": "adapted-fair only",
+      "proximity": "adapted-fair only",
+      "hedrarag": false,
+      "mnemorag": true
+    }
+  },
+  "mnemorag_vs_proximity_gate": {
+    "scope": "adapted_fair lane only",
+    "optimization_policy": "Improve MnemoRAG; never weaken or delay Proximity.",
+    "selection_policy": "Tune on disjoint calibration rows and report once on locked evaluation rows.",
+    "minimum_quality": "Recall@3 must be no more than 0.005 below Proximity and no more than 0.005 below the locked Faiss reference contract.",
+    "performance_targets": {
+      "mean_latency_reduction_each_dataset": 0.10,
+      "geometric_mean_latency_reduction": 0.15
+    },
+    "required_repetitions": 3,
+    "required_evidence": [
+      "paired per-request bootstrap confidence interval",
+      "stage attribution for the speedup",
+      "actual similarity-aware retrieval action and probe distributions",
+      "no source changes between start and end hashes"
+    ]
+  }
+}
