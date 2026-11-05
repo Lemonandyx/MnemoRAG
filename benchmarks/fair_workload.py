@@ -95,6 +95,7 @@ def build_trace_manifest(
     *,
     sample_indices: Iterable[int] | None = None,
     dataset_sha256: str | None = None,
+    workload_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical = validate_arrival_offsets(offsets, request_count=spec.request_count)
     duration_s = float(canonical[-1]) if canonical.size else 0.0
@@ -117,6 +118,12 @@ def build_trace_manifest(
         manifest["sample_indices_count"] = int(indices.size)
     if dataset_sha256 is not None:
         manifest["dataset_sha256"] = str(dataset_sha256)
+    if workload_identity is not None:
+        if not workload_identity.get("role"):
+            raise ValueError("workload identity must declare a nonempty role")
+        manifest["workload_identity"] = json.loads(
+            json.dumps(workload_identity, sort_keys=True)
+        )
     return manifest
 
 
@@ -126,6 +133,7 @@ def validate_trace_workload(
     *,
     sample_indices: Iterable[int],
     dataset_sha256: str,
+    workload_identity: dict[str, Any] | None = None,
 ) -> None:
     """Reject a trace that was not built for the exact evaluated workload."""
     if manifest.get("spec") != asdict(spec):
@@ -135,6 +143,11 @@ def validate_trace_workload(
         raise ValueError("arrival trace sample order does not match this point")
     if manifest.get("dataset_sha256") != str(dataset_sha256):
         raise ValueError("arrival trace dataset digest does not match this point")
+    if workload_identity is not None:
+        if manifest.get("workload_identity") != workload_identity:
+            raise ValueError(
+                "arrival trace workload identity does not match this point"
+            )
 
 
 def summarize_latency_slo(
@@ -165,6 +178,7 @@ def write_trace_bundle(
     *,
     sample_indices: Iterable[int] | None = None,
     dataset_sha256: str | None = None,
+    workload_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Atomically persist a trace and the fingerprints used for result audits."""
     path = Path(path)
@@ -175,6 +189,7 @@ def write_trace_bundle(
         canonical,
         sample_indices=sample_indices,
         dataset_sha256=dataset_sha256,
+        workload_identity=workload_identity,
     )
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as stream:

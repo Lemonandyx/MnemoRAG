@@ -206,7 +206,51 @@ def _require_prompt_contract(summary: Mapping[str, Any]) -> dict[str, Any]:
     return observed
 
 
-def validate_standalone_point(summary: Mapping[str, Any]) -> dict[str, Any]:
+def validate_result_workload_identity(
+    summary: Mapping[str, Any],
+    *,
+    expected_role: str | None,
+) -> dict[str, Any] | None:
+    trace = summary.get("arrival_trace_manifest") or {}
+    identity = trace.get("workload_identity")
+    system = str(summary.get("system") or "unknown")
+    if identity is None:
+        if expected_role is not None:
+            raise ComparisonContractError(
+                f"{system}: missing workload identity for role {expected_role}"
+            )
+        return None
+    if not isinstance(identity, Mapping):
+        raise ComparisonContractError(f"{system}: workload identity is not an object")
+    if expected_role is not None and identity.get("role") != expected_role:
+        raise ComparisonContractError(
+            f"{system}: workload role {identity.get('role')!r} does not match "
+            f"{expected_role!r}"
+        )
+    expected_fields = {
+        "dataset": summary.get("dataset"),
+        "measurement_rows": int(summary.get("num_requests", -1)),
+        "dataset_sha256": trace.get("dataset_sha256"),
+        "sample_indices_array_sha256": trace.get("sample_indices_sha256"),
+    }
+    mismatches = {
+        key: {"expected": expected, "observed": identity.get(key)}
+        for key, expected in expected_fields.items()
+        if identity.get(key) != expected
+    }
+    if mismatches:
+        raise ComparisonContractError(
+            f"{system}: workload identity is inconsistent with the result trace: "
+            + json.dumps(mismatches, sort_keys=True)
+        )
+    return dict(identity)
+
+
+def validate_standalone_point(
+    summary: Mapping[str, Any],
+    *,
+    expected_workload_role: str | None = None,
+) -> dict[str, Any]:
     """Validate one point without asserting a matched cross-system sample."""
     system = str(summary.get("system") or "unknown")
     if system not in REQUIRED_SYSTEMS:
@@ -220,6 +264,9 @@ def validate_standalone_point(summary: Mapping[str, Any]) -> dict[str, Any]:
     _require_metric_contract(summary)
     _require_latency_accounting(summary)
     prompt = _require_prompt_contract(summary)
+    workload_identity = validate_result_workload_identity(
+        summary, expected_role=expected_workload_role
+    )
     return {
         "status": "valid",
         "system": system,
@@ -227,6 +274,7 @@ def validate_standalone_point(summary: Mapping[str, Any]) -> dict[str, Any]:
         "cpu_topology": summary["cpu_topology"],
         "numa_policy": summary["numa_policy"],
         "prompt_contract": prompt,
+        "workload_identity": workload_identity,
     }
 
 
@@ -234,6 +282,7 @@ def validate_fair_comparison_group(
     summaries: Sequence[Mapping[str, Any]],
     *,
     required_systems: Sequence[str] = REQUIRED_SYSTEMS,
+    expected_workload_role: str | None = None,
 ) -> dict[str, Any]:
     """Validate one point containing one result from each compared system."""
     required_systems = tuple(map(str, required_systems))
@@ -257,6 +306,7 @@ def validate_fair_comparison_group(
         )
 
     prompt_contracts = {}
+    workload_identities = {}
     for system, summary in by_system.items():
         if summary.get("status") != "complete":
             raise ComparisonContractError(f"{system}: point is not complete")
@@ -267,6 +317,9 @@ def validate_fair_comparison_group(
         _require_metric_contract(summary)
         _require_latency_accounting(summary)
         prompt_contracts[system] = _require_prompt_contract(summary)
+        workload_identities[system] = validate_result_workload_identity(
+            summary, expected_role=expected_workload_role
+        )
     positions = sorted(
         int(summary.get("campaign_order_position", -1))
         for summary in by_system.values()
@@ -314,6 +367,18 @@ def validate_fair_comparison_group(
                 "observed": observed,
             }
 
+    reference_identity = workload_identities[required_systems[0]]
+    observed_identities = {
+        system: identity
+        for system, identity in workload_identities.items()
+        if identity != reference_identity
+    }
+    if observed_identities:
+        mismatches["arrival_trace_manifest.workload_identity"] = {
+            "expected": reference_identity,
+            "observed": observed_identities,
+        }
+
     reference_topology = reference["cpu_topology"]
     for field in ("logical_cpu_ids", "socket_ids", "numa_node_ids"):
         expected = reference_topology.get(field)
@@ -356,6 +421,7 @@ def validate_fair_comparison_group(
         "common_point": {field: reference[field] for field in COMMON_POINT_FIELDS},
         "sample_indices_sha256": reference_manifest["sample_indices_sha256"],
         "dataset_sha256": reference_manifest["dataset_sha256"],
+        "workload_identity": reference_identity,
         "cpu_topology": {
             field: reference_topology.get(field)
             for field in ("logical_cpu_ids", "socket_ids", "numa_node_ids")

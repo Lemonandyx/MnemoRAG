@@ -45,6 +45,7 @@ try:
         mnemo_full_groups,
         select_boundary_qps_by_dataset,
     )
+    from .workload_identity import FORMAL_QPS_PROXY, audit_workload_identity
 except ImportError:
     from benchmark_point import DATASET_PATHS, validate_physical_cpu_ids
     from comparison_validation import (
@@ -73,6 +74,7 @@ except ImportError:
         mnemo_full_groups,
         select_boundary_qps_by_dataset,
     )
+    from workload_identity import FORMAL_QPS_PROXY, audit_workload_identity
 
 
 HERE = Path(__file__).resolve().parent
@@ -773,6 +775,14 @@ def load_preselected_indices(
         warmup_indices,
         np.asarray(excluded_indices, dtype="<i8"),
     )
+    workload_identity = audit_workload_identity(
+        manifest_path,
+        expected_role=FORMAL_QPS_PROXY,
+        sample_indices_path=indices_path,
+        warmup_indices_path=warmup_indices_path,
+        expected_dataset=dataset,
+        expected_request_count=request_count,
+    )
     return indices, {
         "selection_dataset_dir": str(dataset_dir.resolve()),
         "dataset_sha256": dataset_sha256,
@@ -789,6 +799,7 @@ def load_preselected_indices(
         "headline_disclosure_required": bool(
             manifest.get("headline_disclosure_required")
         ),
+        "workload_identity": workload_identity,
     }
 
 
@@ -832,6 +843,22 @@ def prepare_trace(
                 raise ValueError(
                     f"existing trace does not use the audited {group.dataset} selection"
                 )
+            identity = selection_evidence["workload_identity"]
+            observed_identity = manifest.get("workload_identity")
+            if observed_identity is None:
+                manifest = write_trace_bundle(
+                    trace_path,
+                    spec,
+                    offsets,
+                    sample_indices=indices,
+                    dataset_sha256=dataset_digest,
+                    workload_identity=identity,
+                )
+            elif observed_identity != identity:
+                raise ValueError(
+                    "existing trace has the wrong workload identity for "
+                    f"{group.dataset}"
+                )
         return trace_path, selection_evidence
     source_count = dataset_row_count(dataset_path)
     selection_evidence = None
@@ -858,6 +885,11 @@ def prepare_trace(
         offsets,
         sample_indices=indices,
         dataset_sha256=dataset_digest,
+        workload_identity=(
+            selection_evidence["workload_identity"]
+            if selection_evidence is not None
+            else None
+        ),
     )
     return trace_path, selection_evidence
 
@@ -1188,15 +1220,24 @@ def load_accepted_group(
         json.loads((group_dir / relative).read_text(encoding="utf-8"))
         for relative in metadata["summary_paths"]
     ]
+    expected_workload_role = (
+        ((metadata.get("workload_selection") or {}).get("workload_identity") or {}).get(
+            "role"
+        )
+    )
     if metadata.get("evaluation_scope") == "full_split_long_horizon":
         if len(summaries) != 1 or summaries[0].get("system") != "mnemorag":
             raise ValueError(f"invalid full-split marker in {group_dir}")
-        validate_standalone_point(summaries[0])
+        validate_standalone_point(
+            summaries[0], expected_workload_role=expected_workload_role
+        )
         validate_mnemorag_full_optimizations(summaries[0])
         return summaries
     if metadata.get("evaluation_scope") == "slo_censored_partial":
         for summary in summaries:
-            validate_standalone_point(summary)
+            validate_standalone_point(
+                summary, expected_workload_role=expected_workload_role
+            )
         mnemo = next(
             (summary for summary in summaries if summary["system"] == "mnemorag"),
             None,
@@ -1207,6 +1248,7 @@ def load_accepted_group(
     validate_fair_comparison_group(
         summaries,
         required_systems=tuple(metadata["group"]["system_order"]),
+        expected_workload_role=expected_workload_role,
     )
     validate_mnemorag_full_optimizations(
         next(summary for summary in summaries if summary["system"] == "mnemorag")
@@ -1346,6 +1388,9 @@ def run_group(
         }
     )
     full_split = group.system_order == ("mnemorag",)
+    expected_workload_role = (
+        (selection_evidence or {}).get("workload_identity") or {}
+    ).get("role")
     if full_split:
         source_count = int(mnemo_summary["source_queries"])
         excluded = set(map(int, history_indices))
@@ -1375,11 +1420,14 @@ def run_group(
         mnemo_summary["headline_eligible"] = True
         mnemo_summary["matched_cross_system_comparison_eligible"] = False
         atomic_write_json(group_dir / summary_paths[0], mnemo_summary)
-        validation = validate_standalone_point(mnemo_summary)
+        validation = validate_standalone_point(
+            mnemo_summary, expected_workload_role=expected_workload_role
+        )
     elif len(summaries) == len(group.system_order):
         validation = validate_fair_comparison_group(
             summaries,
             required_systems=group.system_order,
+            expected_workload_role=expected_workload_role,
         )
     else:
         validation = {
@@ -1388,7 +1436,10 @@ def run_group(
             "systems_measured": [summary["system"] for summary in summaries],
             "systems_skipped": sorted(skipped),
             "standalone_validations": [
-                validate_standalone_point(summary) for summary in summaries
+                validate_standalone_point(
+                    summary, expected_workload_role=expected_workload_role
+                )
+                for summary in summaries
             ],
         }
     atomic_write_json(

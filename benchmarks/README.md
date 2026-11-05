@@ -47,6 +47,7 @@ Optional baseline roots are supplied through `HEDRARAG_ROOT`,
 | `run_retrieval_cache_campaign.py` | nprobe and arrival-rate cache sweep |
 | `run_prefix_campaign.py` | Prefix-cache policy comparison |
 | `run_mnemo_ablation.py` | Similarity-aware retrieval, Hotness, Async, and Full component ablation |
+| `workload_identity.py` | Fail-closed role, sample, warmup, and trace identity audit |
 | `document_ordering/run.py` | 512-request ordering-hint validation |
 | `motivation/` | Background and motivation measurements |
 | `baselines/` | Baseline-specific adapters |
@@ -65,3 +66,20 @@ python -m benchmarks.run_mnemo_ablation \
 
 Use `--help` on each program for its complete contract. Raw results belong
 under `results/` and are excluded from version control.
+
+Before an ad hoc formal-QPS run, bind the intended role explicitly. This
+prevents another 512-row artifact, such as the document-ordering stress set,
+from being accepted merely because its request count matches:
+
+```bash
+python -m benchmarks.workload_identity \
+  --selection-manifest /path/to/nq/selection_manifest.json \
+  --expected-role formal_qps_proxy \
+  --arrival-trace /path/to/workload.npz \
+  --expected-dataset nq \
+  --expected-request-count 512
+```
+
+The full campaign runner performs this audit automatically, embeds the
+canonical identity in the arrival-trace manifest, and rechecks it during
+comparison validation.
