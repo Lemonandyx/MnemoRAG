@@ -20,6 +20,7 @@ import os
 import platform
 import random
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -79,7 +80,9 @@ except ImportError:
     )
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(
+    os.environ.get("MNEMORAG_PROJECT_ROOT", Path(__file__).resolve().parents[1])
+).resolve()
 ASSET_ROOT = Path(
     os.environ.get("MNEMORAG_ASSET_ROOT", PROJECT_ROOT / "assets")
 ).resolve()
@@ -480,6 +483,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     parser.add_argument("--gpu-id", default="0")
     parser.add_argument(
+        "--kv-cache-dtype",
+        choices=("auto", "fp8"),
+        default="auto",
+        help="vLLM GPU KV-cache dtype. Figure 14 uses fp8.",
+    )
+    parser.add_argument(
         "--startup-gpu-reservation-mib",
         type=float,
         default=0.0,
@@ -508,6 +517,35 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=600.0,
         help="Half-life for the exponentially decayed heat policy.",
+    )
+    parser.add_argument(
+        "--kv-heat-formula",
+        choices=("exponential_decay", "legacy_log_denominator"),
+        default="exponential_decay",
+        help=(
+            "GPU KV heat formula. legacy_log_denominator is the repaired "
+            "historical H_i/log(1+t_i/tau) timestamp implementation with a "
+            "zero-time guard and explicit time scale."
+        ),
+    )
+    parser.add_argument(
+        "--kv-profile-priority-mode",
+        choices=("formula_tiebreak", "profile_only"),
+        default="formula_tiebreak",
+        help=(
+            "How an offline next-use profile composes with heat. The default "
+            "keeps next-use as the primary key and executes the selected heat "
+            "formula as a bounded tie-break; profile_only is an audited ablation."
+        ),
+    )
+    parser.add_argument(
+        "--kv-heat-legacy-time-scale-s",
+        type=float,
+        default=1.0,
+        help=(
+            "Time unit used by the repaired legacy logarithmic denominator; "
+            "must be positive so the log argument is dimensionless."
+        ),
     )
     parser.add_argument(
         "--kv-heat-source",
@@ -619,6 +657,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cpu-kv-num-blocks",
+        type=int,
+        default=0,
+        help=(
+            "Exact CPU KV capacity in blocks. A positive value overrides the "
+            "capacity-derived block count; Figure 14 uses 130000."
+        ),
+    )
+    parser.add_argument(
         "--cpu-kv-block-size",
         type=int,
         default=DEFAULT_CPU_KV_BLOCK_SIZE,
@@ -712,6 +759,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--cpu-kv-lazy-mmap-dir",
+        type=Path,
+        default=Path("/dev/shm"),
+        help=(
+            "Backing directory for the lazy tier in hybrid_pinned_lazy mode. "
+            "Use a disk-backed filesystem when the logical CPU KV capacity "
+            "would otherwise create unreclaimable tmpfs pressure."
+        ),
+    )
+    parser.add_argument(
         "--cpu-kv-staging-buffer-blocks",
         type=int,
         default=1024,
@@ -760,7 +817,9 @@ def parse_args() -> argparse.Namespace:
 def derive_cpu_kv_layout(
     args: argparse.Namespace,
 ) -> dict[str, int | float | bool | str]:
-    enabled = args.cpu_kv_cache_gib > 0
+    if args.cpu_kv_num_blocks < 0:
+        raise ValueError("--cpu-kv-num-blocks must be nonnegative")
+    enabled = args.cpu_kv_num_blocks > 0 or args.cpu_kv_cache_gib > 0
     if not enabled:
         return {
             "enabled": False,
@@ -768,7 +827,10 @@ def derive_cpu_kv_layout(
             "capacity_gib": 0.0,
             "block_size_tokens": args.cpu_kv_block_size,
             "block_bytes": 0,
+            "kv_cache_dtype": str(getattr(args, "kv_cache_dtype", "auto")),
+            "dtype_bytes": 0,
             "num_cpu_blocks": 0,
+            "capacity_source": "disabled",
             "eviction_policy": args.cpu_kv_eviction_policy,
             "batch_h2d_transfers": bool(args.cpu_kv_batch_h2d_transfers),
             "batch_d2h_transfers": bool(args.cpu_kv_batch_d2h_transfers),
@@ -781,6 +843,8 @@ def derive_cpu_kv_layout(
             "host_memory_mode": args.cpu_kv_host_memory_mode,
             "lazy_allocation": None,
             "lazy_mmap_dir": None,
+            "lazy_backing_required_bytes": 0,
+            "lazy_backing_free_bytes": None,
             "pinned_tier_gb": 0.0,
             "pinned_tier_gib": 0.0,
             "pinned_tier_blocks": 0,
@@ -794,7 +858,10 @@ def derive_cpu_kv_layout(
         raise ValueError("--cpu-kv-min-document-heat-to-store must be at least one")
     if args.cpu_kv_pinned_tier_gib < 0:
         raise ValueError("--cpu-kv-pinned-tier-gib must be nonnegative")
-    if args.cpu_kv_pinned_tier_gib > args.cpu_kv_cache_gib:
+    if (
+        not args.cpu_kv_num_blocks
+        and args.cpu_kv_pinned_tier_gib > args.cpu_kv_cache_gib
+    ):
         raise ValueError("--cpu-kv-pinned-tier-gib cannot exceed --cpu-kv-cache-gib")
     if args.cpu_kv_staging_buffer_blocks < 1:
         raise ValueError("--cpu-kv-staging-buffer-blocks must be positive")
@@ -808,20 +875,33 @@ def derive_cpu_kv_layout(
     kv_heads = int(model_config.get("num_key_value_heads", attention_heads))
     layers = int(model_config["num_hidden_layers"])
     head_dim = int(model_config.get("head_dim") or hidden_size // attention_heads)
-    dtype_name = str(model_config.get("torch_dtype", "bfloat16")).lower()
+    configured_kv_dtype = str(getattr(args, "kv_cache_dtype", "auto")).lower()
+    dtype_name = (
+        str(model_config.get("torch_dtype", "bfloat16")).lower()
+        if configured_kv_dtype == "auto"
+        else configured_kv_dtype
+    )
     dtype_bytes = {
         "float16": 2,
         "half": 2,
         "bfloat16": 2,
         "float32": 4,
+        "fp8": 1,
+        "fp8_e4m3": 1,
+        "fp8_e4m3fn": 1,
+        "fp8_e5m2": 1,
     }.get(dtype_name)
     if dtype_bytes is None:
         raise ValueError(f"Unsupported KV dtype for capacity derivation: {dtype_name}")
     block_bytes = (
         2 * layers * kv_heads * head_dim * args.cpu_kv_block_size * dtype_bytes
     )
-    capacity_bytes = int(args.cpu_kv_cache_gib * 1024**3)
-    num_cpu_blocks = capacity_bytes // block_bytes
+    if args.cpu_kv_num_blocks:
+        num_cpu_blocks = int(args.cpu_kv_num_blocks)
+        capacity_bytes = num_cpu_blocks * block_bytes
+    else:
+        capacity_bytes = int(args.cpu_kv_cache_gib * 1024**3)
+        num_cpu_blocks = capacity_bytes // block_bytes
     pinned_tier_bytes = int(args.cpu_kv_pinned_tier_gib * 1024**3)
     if args.cpu_kv_host_memory_mode == "pinned_eager":
         pinned_tier_bytes = capacity_bytes
@@ -830,13 +910,49 @@ def derive_cpu_kv_layout(
     pinned_tier_blocks = min(num_cpu_blocks, pinned_tier_bytes // block_bytes)
     if num_cpu_blocks < 1:
         raise ValueError("--cpu-kv-cache-gib is smaller than one KV block")
+    lazy_mmap_dir = Path(
+        getattr(args, "cpu_kv_lazy_mmap_dir", Path("/dev/shm"))
+    )
+    if args.cpu_kv_host_memory_mode == "hybrid_pinned_lazy":
+        if not lazy_mmap_dir.is_dir():
+            raise ValueError(
+                "--cpu-kv-lazy-mmap-dir must name an existing directory in "
+                "hybrid_pinned_lazy mode"
+            )
+        lazy_allocation = (
+            "tmpfs_mmap"
+            if lazy_mmap_dir.resolve() == Path("/dev/shm").resolve()
+            else "file_mmap"
+        )
+        lazy_backing_required_bytes = (
+            num_cpu_blocks - pinned_tier_blocks
+        ) * block_bytes
+        lazy_backing_free_bytes = shutil.disk_usage(lazy_mmap_dir).free
+        if (
+            lazy_allocation == "file_mmap"
+            and lazy_backing_free_bytes < lazy_backing_required_bytes
+        ):
+            raise ValueError(
+                "--cpu-kv-lazy-mmap-dir has insufficient free space: "
+                f"requires {lazy_backing_required_bytes} bytes, has "
+                f"{lazy_backing_free_bytes} bytes"
+            )
+    else:
+        lazy_allocation = None
+        lazy_backing_required_bytes = 0
+        lazy_backing_free_bytes = None
     return {
         "enabled": True,
         "capacity_gb": float(capacity_bytes / 1000**3),
-        "capacity_gib": float(args.cpu_kv_cache_gib),
+        "capacity_gib": float(capacity_bytes / 1024**3),
         "block_size_tokens": int(args.cpu_kv_block_size),
         "block_bytes": int(block_bytes),
+        "kv_cache_dtype": dtype_name,
+        "dtype_bytes": int(dtype_bytes),
         "num_cpu_blocks": int(num_cpu_blocks),
+        "capacity_source": (
+            "exact_block_count" if args.cpu_kv_num_blocks else "capacity_gib"
+        ),
         "eviction_policy": args.cpu_kv_eviction_policy,
         "batch_h2d_transfers": bool(args.cpu_kv_batch_h2d_transfers),
         "batch_d2h_transfers": bool(args.cpu_kv_batch_d2h_transfers),
@@ -847,13 +963,17 @@ def derive_cpu_kv_layout(
         "h2d_stream_priority": int(args.cpu_kv_h2d_stream_priority),
         "d2h_stream_priority": int(args.cpu_kv_d2h_stream_priority),
         "host_memory_mode": args.cpu_kv_host_memory_mode,
-        "lazy_allocation": (
-            "tmpfs_mmap"
+        "lazy_allocation": lazy_allocation,
+        "lazy_mmap_dir": (
+            str(lazy_mmap_dir)
             if args.cpu_kv_host_memory_mode == "hybrid_pinned_lazy"
             else None
         ),
-        "lazy_mmap_dir": (
-            "/dev/shm" if args.cpu_kv_host_memory_mode == "hybrid_pinned_lazy" else None
+        "lazy_backing_required_bytes": int(lazy_backing_required_bytes),
+        "lazy_backing_free_bytes": (
+            int(lazy_backing_free_bytes)
+            if lazy_backing_free_bytes is not None
+            else None
         ),
         "pinned_tier_gb": float(pinned_tier_blocks * block_bytes / 1000**3),
         "pinned_tier_gib": float(pinned_tier_blocks * block_bytes / 1024**3),
@@ -1075,6 +1195,7 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
     else:
         os.environ.pop("VLLM_MAX_NUM_BATCHED_TOKENS", None)
     os.environ["VLLM_GPU_MEMORY_UTILIZATION"] = str(args.gpu_memory_utilization)
+    os.environ["VLLM_KV_CACHE_DTYPE"] = args.kv_cache_dtype
     os.environ["MNEMORAG_T_REUSE"] = str(args.tau_reuse)
     os.environ["MNEMORAG_T_GUIDED"] = str(args.tau_guided)
     os.environ["MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"] = "1"
@@ -1089,6 +1210,16 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
     os.environ["VLLM_KV_FREE_BLOCK_POLICY"] = policy
     os.environ["VLLM_KV_HEAT_HALF_LIFE_S"] = str(args.kv_heat_half_life_s)
     os.environ["VLLM_KV_HEAT_SOURCE"] = args.kv_heat_source
+    os.environ["VLLM_KV_HEAT_FORMULA"] = args.kv_heat_formula
+    os.environ["VLLM_KV_PROFILE_PRIORITY_MODE"] = args.kv_profile_priority_mode
+    if args.kv_heat_legacy_time_scale_s <= 0:
+        raise ValueError("--kv-heat-legacy-time-scale-s must be positive")
+    os.environ["VLLM_KV_HEAT_LEGACY_TIME_SCALE_S"] = str(
+        args.kv_heat_legacy_time_scale_s
+    )
+    # The named formula is authoritative. Do not let an inherited compatibility
+    # flag silently switch or conflict with the experiment contract.
+    os.environ.pop("VLLM_KV_HEAT_LEGACY_TIMESTAMP_SCORE", None)
     cpu_kv = derive_cpu_kv_layout(args)
     args.cpu_kv_layout = cpu_kv
     for name in (
@@ -1153,6 +1284,7 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
             f"({cpu_kv['capacity_gib']:.3f} GiB), "
             f"block_size={cpu_kv['block_size_tokens']} tokens, "
             f"block_bytes={cpu_kv['block_bytes']}, "
+            f"kv_cache_dtype={cpu_kv['kv_cache_dtype']}, "
             f"num_cpu_blocks={cpu_kv['num_cpu_blocks']}, "
             f"eviction_policy={cpu_kv['eviction_policy']}, "
             f"batch_h2d={cpu_kv['batch_h2d_transfers']}, "
@@ -1167,6 +1299,8 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
             f"host_memory_mode={cpu_kv['host_memory_mode']} "
             f"lazy_allocation={cpu_kv['lazy_allocation']} "
             f"lazy_mmap_dir={cpu_kv['lazy_mmap_dir']} "
+            "lazy_backing_required_bytes="
+            f"{cpu_kv['lazy_backing_required_bytes']} "
             f"pinned_tier_gb={cpu_kv['pinned_tier_gb']:.3f} "
             f"pinned_tier_blocks={cpu_kv['pinned_tier_blocks']} "
             f"staging_buffer_blocks={cpu_kv['staging_buffer_blocks']}",
@@ -1976,6 +2110,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 "ignore_eos": args.ignore_eos,
             },
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "kv_cache_dtype": args.kv_cache_dtype,
             "enable_prefix_caching": args.prefix_caching,
             "ivf_nprobe": args.nprobe,
             "enable_similarity_aware": similarity,
@@ -2112,6 +2247,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "enable_prefix_caching": bool(args.prefix_caching),
+        "kv_cache_dtype": args.kv_cache_dtype,
     }
     if args.max_num_batched_tokens > 0:
         expected_vllm_contract["max_num_batched_tokens"] = args.max_num_batched_tokens
@@ -2743,6 +2879,22 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 "size_bytes": profile_next_use_path.stat().st_size,
             }
         )
+    cpu_profile_path_raw = os.environ.get(
+        "VLLM_CPU_KV_ADMISSION_PROFILE_PATH", ""
+    )
+    cpu_kv_admission_profile = {
+        "enabled": bool(cpu_profile_path_raw),
+        "mode": os.environ.get("VLLM_CPU_KV_PROFILE_MODE", "").strip().lower(),
+    }
+    if cpu_profile_path_raw:
+        cpu_profile_path = Path(cpu_profile_path_raw).resolve()
+        cpu_kv_admission_profile.update(
+            {
+                "path": str(cpu_profile_path),
+                "sha256": file_sha256(cpu_profile_path),
+                "size_bytes": cpu_profile_path.stat().st_size,
+            }
+        )
 
     retrieval_profile = (
         pipeline.retriever.retrieval_profile()
@@ -2776,6 +2928,10 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "enable_hotness_sort": hotness,
         "enable_async_scheduling": async_enabled,
         "kv_policy": policy,
+        "kv_cache_dtype": args.kv_cache_dtype,
+        "kv_heat_formula": args.kv_heat_formula,
+        "kv_profile_priority_mode": args.kv_profile_priority_mode,
+        "kv_heat_legacy_time_scale_s": args.kv_heat_legacy_time_scale_s,
         "kv_heat_half_life_s": args.kv_heat_half_life_s,
         "kv_heat_source": args.kv_heat_source,
         "document_kv_heat": args.document_kv_heat,
@@ -2783,6 +2939,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "document_hotness_prior": document_hotness_prior,
         "query_base_snapshot": query_base_snapshot,
         "profile_guided_online_serving": profile_guided_online_serving,
+        "cpu_kv_admission_profile": cpu_kv_admission_profile,
         "implementation_fidelity": (
             {
                 "scheduler": "flashrag_native_pipeline",
@@ -2933,6 +3090,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "ignore_eos": args.ignore_eos,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
+        "kv_cache_dtype": args.kv_cache_dtype,
         "prefix_caching": args.prefix_caching,
         "model_path": str(ASSET_ROOT / "models/llama3-8B-instruct"),
         "retrieval_model_path": str(ASSET_ROOT / "models/e5-large-v2"),

@@ -200,6 +200,8 @@ class BlockPool:
         ] = OrderedDict()
         self.document_heat_accesses = 0
         self.document_heat_blocks = 0
+        self.document_heat_above_one_blocks = 0
+        self.document_heat_max = 0.0
         self.heat_source = os.environ.get(
             "VLLM_KV_HEAT_SOURCE", "document"
         ).strip().lower()
@@ -216,6 +218,22 @@ class BlockPool:
         self.oracle_access_count = 0
         self.oracle_match_count = 0
         self.oracle_finite_count = 0
+        self.profile_record_path = os.environ.get(
+            "VLLM_KV_PROFILE_RECORD_PATH", ""
+        ).strip()
+        self.profile_record_count = 0
+        self.profile_record_handle = None
+        if self.profile_record_path:
+            self.profile_record_handle = open(
+                self.profile_record_path,
+                "a",
+                encoding="utf-8",
+                buffering=1,
+            )
+            logger.info(
+                "[MnemoRAG] Recording KV block accesses to %s",
+                self.profile_record_path,
+            )
         if profile_path:
             with open(profile_path, encoding="utf-8") as handle:
                 self.oracle_next_use = {
@@ -297,16 +315,41 @@ class BlockPool:
             "heap_entries": len(queue.heap),
             "heap_stale_pops": queue.heap_stale_pops,
             "heap_compactions": queue.heap_compactions,
+            "heat_formula": queue.heat_formula,
+            "heat_half_life_s": queue.heat_half_life_s,
+            "heat_formula_priority_calls": queue.heat_formula_priority_calls,
+            "legacy_zero_guard_calls": queue.legacy_zero_guard_calls,
+            "legacy_time_scale_s": queue.legacy_time_scale_s,
+            "profile_next_use_configured": queue.profile_next_use_configured,
+            "profile_next_use_observe_only": queue.profile_next_use_observe_only,
+            "profile_next_use_influences_eviction": queue.profile_next_use,
+            "profile_priority_mode": queue.profile_priority_mode,
+            "profile_formula_tiebreak_calls": (
+                queue.profile_formula_tiebreak_calls
+            ),
+            "profile_formula_tiebreak_evictions": (
+                queue.profile_formula_tiebreak_evictions
+            ),
             "pattern_metadata_capacity": self.pattern_metadata_capacity,
             "pattern_heat_entries": len(self.block_pattern_heat),
             "heat_source": self.heat_source,
             "document_heat_accesses": self.document_heat_accesses,
             "document_heat_blocks": self.document_heat_blocks,
+            "document_heat_above_one_blocks": (
+                self.document_heat_above_one_blocks
+            ),
+            "document_heat_max": self.document_heat_max,
             "pattern_utility_entries": len(self.block_pattern_utility),
             "pattern_pgdsf_entries": len(self.block_pattern_pgdsf),
             "pattern_metadata_evictions": dict(
                 self.pattern_metadata_evictions
             ),
+            "profile_record_path": self.profile_record_path or None,
+            "profile_record_count": self.profile_record_count,
+            "profile_next_use_hashes": len(self.oracle_next_use),
+            "profile_next_use_accesses": self.oracle_access_count,
+            "profile_next_use_matches": self.oracle_match_count,
+            "profile_next_use_finite": self.oracle_finite_count,
         }
 
     def _get_document_block_heat(
@@ -335,7 +378,11 @@ class BlockPool:
         if not covered_tokens:
             return None
         self.document_heat_blocks += 1
-        return weighted_heat / covered_tokens
+        document_heat = weighted_heat / covered_tokens
+        if document_heat > 1.0:
+            self.document_heat_above_one_blocks += 1
+        self.document_heat_max = max(self.document_heat_max, document_heat)
+        return document_heat
 
 
     def get_cached_block(
@@ -522,9 +569,23 @@ class BlockPool:
     ) -> None:
         """Update LFU heat, decayed utility, or RAGCache-style PGDSF."""
         policy = self.free_block_queue.eviction_policy
+        raw_hash = None
+        if self.profile_record_handle is not None or self.oracle_next_use:
+            raw_hash = get_block_hash(block_hash)
+        if self.profile_record_handle is not None:
+            self.profile_record_handle.write(
+                json.dumps(
+                    {
+                        "block_hash": raw_hash.hex(),
+                        "request_position": request_position,
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            self.profile_record_count += 1
         if self.oracle_next_use:
             self.oracle_access_count += 1
-            raw_hash = get_block_hash(block_hash)
             positions = self.oracle_next_use.get(raw_hash)
             if positions is not None:
                 self.oracle_match_count += 1

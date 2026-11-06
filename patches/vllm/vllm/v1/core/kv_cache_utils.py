@@ -217,6 +217,43 @@ class FreeKVCacheBlockQueue:
         if self.heat_half_life_s <= 0:
             raise ValueError("VLLM_KV_HEAT_HALF_LIFE_S must be positive")
         self.heat_decay_lambda = math.log(2.0) / self.heat_half_life_s
+        legacy_timestamp_score = (
+            os.environ.get("VLLM_KV_HEAT_LEGACY_TIMESTAMP_SCORE", "0") == "1"
+        )
+        configured_heat_formula = os.environ.get("VLLM_KV_HEAT_FORMULA")
+        if configured_heat_formula is None:
+            self.heat_formula = (
+                "legacy_log_denominator"
+                if legacy_timestamp_score
+                else "exponential_decay"
+            )
+        else:
+            self.heat_formula = configured_heat_formula.strip().lower()
+            if legacy_timestamp_score and self.heat_formula != "legacy_log_denominator":
+                raise ValueError(
+                    "VLLM_KV_HEAT_FORMULA conflicts with "
+                    "VLLM_KV_HEAT_LEGACY_TIMESTAMP_SCORE=1"
+                )
+        if self.heat_formula not in {
+            "exponential_decay",
+            "legacy_log_denominator",
+        }:
+            raise ValueError(
+                "VLLM_KV_HEAT_FORMULA must be 'exponential_decay' or "
+                "'legacy_log_denominator'"
+            )
+        self.legacy_timestamp_epsilon_s = float(
+            os.environ.get("VLLM_KV_HEAT_LEGACY_EPSILON_S", "1e-12")
+        )
+        self.legacy_time_scale_s = float(
+            os.environ.get("VLLM_KV_HEAT_LEGACY_TIME_SCALE_S", "1.0")
+        )
+        if self.legacy_timestamp_epsilon_s <= 0:
+            raise ValueError("VLLM_KV_HEAT_LEGACY_EPSILON_S must be positive")
+        if self.legacy_time_scale_s <= 0:
+            raise ValueError(
+                "VLLM_KV_HEAT_LEGACY_TIME_SCALE_S must be positive"
+            )
         self.profile_next_use_configured = bool(
             os.environ.get("VLLM_KV_PROFILE_NEXT_USE_PATH")
             or os.environ.get("VLLM_KV_ORACLE_NEXT_USE_PATH")
@@ -228,6 +265,18 @@ class FreeKVCacheBlockQueue:
             self.profile_next_use_configured
             and not self.profile_next_use_observe_only
         )
+        self.profile_priority_mode = os.environ.get(
+            "VLLM_KV_PROFILE_PRIORITY_MODE", "formula_tiebreak"
+        ).strip().lower()
+        if self.profile_priority_mode not in {"formula_tiebreak", "profile_only"}:
+            raise ValueError(
+                "VLLM_KV_PROFILE_PRIORITY_MODE must be 'formula_tiebreak' or "
+                "'profile_only'"
+            )
+        self.heat_formula_priority_calls = 0
+        self.legacy_zero_guard_calls = 0
+        self.profile_formula_tiebreak_calls = 0
+        self.profile_formula_tiebreak_evictions = 0
         self.heat_frequency_lru = (
             os.environ.get("VLLM_KV_HEAT_FREQUENCY_LRU", "0") == "1"
         )
@@ -306,6 +355,37 @@ class FreeKVCacheBlockQueue:
             self.fake_free_list_head.next_free_block = self.fake_free_list_tail
             self.fake_free_list_tail.prev_free_block = self.fake_free_list_head
 
+    def _heat_formula_priority(self, block: KVCacheBlock) -> float:
+        """Return the selected heat formula in its native score domain."""
+        self.heat_formula_priority_calls += 1
+        if block.heat <= 0:
+            return float("-inf")
+        if self.heat_formula == "legacy_log_denominator":
+            timestamp = max(
+                float(block.last_used_ts), self.legacy_timestamp_epsilon_s
+            )
+            if block.last_used_ts <= self.legacy_timestamp_epsilon_s:
+                self.legacy_zero_guard_calls += 1
+            return block.heat / math.log1p(
+                timestamp / self.legacy_time_scale_s
+            )
+        # Rank by exponentially decayed access frequency:
+        #   heat * exp(-lambda * (now - last_used)).
+        # The common -lambda * now term can be omitted in log space, yielding
+        # a stable heap key that exactly preserves the ordering over time.
+        return math.log(block.heat) + (
+            self.heat_decay_lambda * block.last_used_ts
+        )
+
+    @staticmethod
+    def _bounded_formula_tiebreak(priority: float) -> float:
+        """Bound a formula score so it cannot override next-use ordering."""
+        if priority == float("-inf"):
+            return -0.25
+        if priority == float("inf"):
+            return 0.25
+        return 0.5 * math.atan(priority) / math.pi
+
     def calc_priority(self, block: KVCacheBlock) -> float:
         if self.eviction_policy == "fifo":
             return float(block.fifo_insert_seq)
@@ -313,9 +393,17 @@ class FreeKVCacheBlockQueue:
             self.eviction_policy in {"heat", "chain_heat"}
             and self.profile_next_use
         ):
-            if math.isinf(block.oracle_next_use_request):
-                return -1.0e15
-            return -block.oracle_next_use_request + min(block.heat, 1.0e6) * 1.0e-6
+            profile_priority = (
+                -1.0e12
+                if math.isinf(block.oracle_next_use_request)
+                else -block.oracle_next_use_request
+            )
+            if self.profile_priority_mode == "profile_only":
+                return profile_priority
+            self.profile_formula_tiebreak_calls += 1
+            return profile_priority + self._bounded_formula_tiebreak(
+                self._heat_formula_priority(block)
+            )
         if self.eviction_policy in {
             "utility", "chain_utility", "chain_pgdsf"
         }:
@@ -339,15 +427,7 @@ class FreeKVCacheBlockQueue:
             and self.heat_pure_lfu
         ):
             return block.heat
-        if block.heat <= 0:
-            return float("-inf")
-        # Rank by exponentially decayed access frequency:
-        #   heat * exp(-lambda * (now - last_used)).
-        # The common -lambda * now term can be omitted in log space, yielding
-        # a stable heap key that exactly preserves the ordering over time.
-        return math.log(block.heat) + (
-            self.heat_decay_lambda * block.last_used_ts
-        )
+        return self._heat_formula_priority(block)
 
     def _heap_version(self, block: KVCacheBlock) -> float | int:
         if self.eviction_policy in {
@@ -443,6 +523,8 @@ class FreeKVCacheBlockQueue:
                 self.oracle_pop_count += 1
                 if not math.isinf(block.oracle_next_use_request):
                     self.oracle_finite_pop_count += 1
+                if self.profile_priority_mode == "formula_tiebreak":
+                    self.profile_formula_tiebreak_evictions += 1
                 if self.oracle_pop_count % 10000 == 0:
                     logger.info(
                         "[MnemoRAG] Profile eviction stats: pops=%d, finite=%d, "

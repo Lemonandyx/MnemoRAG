@@ -46,6 +46,8 @@ Optional baseline roots are supplied through `HEDRARAG_ROOT`,
 | `run_retrieval_six_system_four_dataset.py` | Retrieval-only comparison over four datasets |
 | `run_retrieval_cache_campaign.py` | nprobe and arrival-rate cache sweep |
 | `run_prefix_campaign.py` | Prefix-cache policy comparison |
+| `build_next_use_profile.py` | Build paired GPU next-use and productive CPU-admission profiles from an audited block trace |
+| `run_full_nq_heat_contract.py` | Fail-closed 79,168-request NQ comparison of the current and legacy heat formulas under the Figure 14 top-k=3 contract |
 | `run_mnemo_ablation.py` | Similarity-aware retrieval, Hotness, Async, and Full component ablation |
 | `workload_identity.py` | Fail-closed role, sample, warmup, and trace identity audit |
 | `document_ordering/run.py` | 512-request ordering-hint validation |
@@ -83,3 +85,17 @@ python -m benchmarks.workload_identity \
 The full campaign runner performs this audit automatically, embeds the
 canonical identity in the arrival-trace manifest, and rechecks it during
 comparison validation.
+
+The full-NQ heat runner additionally requires FP8 GPU KV at 0.90 utilization,
+64 sequences, 130,000 CPU KV blocks, active H2D and D2H transfers, at least
+99% next-use profile matching, and nonzero selected-formula/tie-break counters.
+CPU KV capacity is derived from the effective KV dtype (one byte per FP8
+element), not the model-weight dtype. `--cpu-kv-pinned-tier-gib` and
+`--cpu-kv-lazy-mmap-dir` preserve the exact block count while allowing the
+remainder of the pool to use audited tmpfs or disk-backed mmap storage; the
+runner fails before launch when a disk-backed directory lacks sufficient free
+space.
+It accepts the historical top-k=3 cumulative result only within the frozen
+absolute interval `0.303006 +/- 0.02`; both formulas must also agree within
+0.5 percentage points. A profile-only run is an explicit ablation and cannot
+pass this contract.

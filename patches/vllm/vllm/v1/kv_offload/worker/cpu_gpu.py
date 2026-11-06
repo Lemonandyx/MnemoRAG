@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
+import tempfile
 import numpy as np
 import torch
 
@@ -106,13 +108,67 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         self.transfer_events: dict[int, tuple[torch.Event, torch.Event]] = {}
         self.events_pool: list[tuple[torch.Event, torch.Event]] = []
         self.completed_cuda_duration_s: dict[int, float] = {}
+        self.staging_refs: dict[int, list[torch.Tensor]] = {}
+        self.d2h_postcopies: dict[
+            int,
+            list[tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]],
+        ] = {}
+        self.active_staging_job: dict[str, int | None] = {
+            "h2d": None,
+            "d2h": None,
+        }
 
-        pin_memory = is_pin_memory_available()
+        self.host_memory_mode = os.environ.get(
+            "VLLM_CPU_KV_HOST_MEMORY_MODE", "pinned_eager"
+        )
+        if self.host_memory_mode not in {
+            "pinned_eager",
+            "pageable_lazy",
+            "hybrid_pinned_lazy",
+        }:
+            raise ValueError(
+                "VLLM_CPU_KV_HOST_MEMORY_MODE must be pinned_eager, "
+                "pageable_lazy, or hybrid_pinned_lazy"
+            )
+        pin_memory = (
+            self.host_memory_mode == "pinned_eager"
+            and is_pin_memory_available()
+        )
+        logger.info(
+            "[MnemoRAG] CPU KV host memory mode: %s (pin_memory=%s)",
+            self.host_memory_mode,
+            pin_memory,
+        )
 
         # allocate cpu tensors
         logger.info("Allocating %d CPU tensors...", len(gpu_caches))
         self.gpu_tensors: list[torch.Tensor] = []
         self.cpu_tensors: list[torch.Tensor] = []
+        self.cpu_pinned_tensors: list[torch.Tensor] = []
+        self.cpu_lazy_tensors: list[torch.Tensor] = []
+        self.h2d_staging_tensors: list[torch.Tensor] = []
+        self.d2h_staging_tensors: list[torch.Tensor] = []
+        self.pinned_tier_blocks = min(
+            num_cpu_blocks,
+            int(os.environ.get("VLLM_CPU_KV_PINNED_TIER_BLOCKS", "0")),
+        )
+        self.pinned_tier_subblocks = (
+            self.pinned_tier_blocks * self.block_size_factor
+        )
+        if (
+            self.host_memory_mode == "hybrid_pinned_lazy"
+            and self.pinned_tier_blocks <= 0
+        ):
+            raise ValueError(
+                "hybrid_pinned_lazy requires a positive pinned tier"
+            )
+        if self.host_memory_mode == "hybrid_pinned_lazy":
+            logger.info(
+                "[MnemoRAG] CPU KV hybrid tiers: pinned_blocks=%d, "
+                "lazy_blocks=%d",
+                self.pinned_tier_blocks,
+                num_cpu_blocks - self.pinned_tier_blocks,
+            )
         self.kv_dim_before_num_blocks: list[bool] = []
         for layer_name, gpu_tensor in gpu_caches.items():
             self.gpu_tensors.append(gpu_tensor)
@@ -146,14 +202,209 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             cpu_shape[num_blocks_idx] = num_cpu_blocks * self.block_size_factor
 
             logger.debug("Allocating CPU tensor of shape %r", cpu_shape)
-            self.cpu_tensors.append(
-                torch.zeros(
-                    cpu_shape,
-                    dtype=gpu_tensor.dtype,
-                    device="cpu",
-                    pin_memory=pin_memory,
+            if self.host_memory_mode == "hybrid_pinned_lazy":
+                pinned_shape = list(cpu_shape)
+                lazy_shape = list(cpu_shape)
+                pinned_shape[num_blocks_idx] = self.pinned_tier_subblocks
+                lazy_shape[num_blocks_idx] -= self.pinned_tier_subblocks
+                self.cpu_pinned_tensors.append(
+                    torch.zeros(
+                        pinned_shape,
+                        dtype=gpu_tensor.dtype,
+                        device="cpu",
+                        pin_memory=is_pin_memory_available(),
+                    )
                 )
+                self.cpu_lazy_tensors.append(
+                    self._allocate_lazy_mmap_tensor(
+                        lazy_shape,
+                        gpu_tensor.dtype,
+                        len(self.cpu_lazy_tensors),
+                    )
+                )
+            else:
+                factory = (
+                    torch.zeros
+                    if self.host_memory_mode == "pinned_eager"
+                    else torch.empty
+                )
+                self.cpu_tensors.append(
+                    factory(
+                        cpu_shape,
+                        dtype=gpu_tensor.dtype,
+                        device="cpu",
+                        pin_memory=pin_memory,
+                    )
+                )
+
+        if self.host_memory_mode != "pinned_eager":
+            staging_source = (
+                self.cpu_lazy_tensors
+                if self.host_memory_mode == "hybrid_pinned_lazy"
+                else self.cpu_tensors
             )
+            staging_bytes = 0
+            staging_max_blocks = int(
+                os.environ.get("VLLM_CPU_KV_STAGING_MAX_BLOCKS", "0")
+            )
+            for gpu_tensor, cpu_tensor, kv_dim in zip(
+                self.gpu_tensors,
+                staging_source,
+                self.kv_dim_before_num_blocks,
+            ):
+                block_dim = 1 if kv_dim else 0
+                staging_blocks = int(gpu_tensor.shape[block_dim])
+                if staging_max_blocks > 0:
+                    staging_blocks = min(staging_blocks, staging_max_blocks)
+                h2d_staging = self._allocate_staging(
+                    cpu_tensor, kv_dim, staging_blocks
+                )
+                d2h_staging = self._allocate_staging(
+                    cpu_tensor, kv_dim, staging_blocks
+                )
+                self.h2d_staging_tensors.append(h2d_staging)
+                self.d2h_staging_tensors.append(d2h_staging)
+                staging_bytes += (
+                    h2d_staging.numel() + d2h_staging.numel()
+                ) * h2d_staging.element_size()
+            logger.info(
+                "[MnemoRAG] CPU KV reusable staging buffers: directions=2, "
+                "max_blocks=%d, bytes=%d",
+                staging_max_blocks,
+                staging_bytes,
+            )
+
+    @staticmethod
+    def _allocate_lazy_mmap_tensor(
+        shape: list[int],
+        dtype: torch.dtype,
+        tensor_index: int,
+    ) -> torch.Tensor:
+        """Map the lazy tier without pre-faulting its logical capacity."""
+        mmap_dir = os.environ.get("VLLM_CPU_KV_LAZY_MMAP_DIR", "/dev/shm")
+        if not os.path.isdir(mmap_dir):
+            raise ValueError(
+                f"CPU KV lazy mmap directory does not exist: {mmap_dir}"
+            )
+        numel = math.prod(shape)
+        element_size = torch.empty((), dtype=dtype).element_size()
+        logical_bytes = numel * element_size
+        path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f"mnemorag-cpu-kv-{tensor_index}-",
+                dir=mmap_dir,
+                delete=False,
+            ) as stream:
+                path = stream.name
+                os.ftruncate(stream.fileno(), logical_bytes)
+            tensor = torch.from_file(
+                path,
+                shared=True,
+                size=numel,
+                dtype=dtype,
+            ).view(shape)
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        backing = "tmpfs_mmap" if mmap_dir == "/dev/shm" else "file_mmap"
+        logger.info(
+            "[MnemoRAG] CPU KV lazy tier backing: %s, "
+            "logical_bytes=%d, directory=%s",
+            backing,
+            logical_bytes,
+            mmap_dir,
+        )
+        return tensor
+
+    @staticmethod
+    def _allocate_staging(
+        tensor: torch.Tensor,
+        kv_dim_before_num_blocks: bool,
+        num_blocks: int,
+    ) -> torch.Tensor:
+        shape = list(tensor.shape)
+        shape[1 if kv_dim_before_num_blocks else 0] = num_blocks
+        return torch.empty(
+            shape,
+            dtype=tensor.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    @staticmethod
+    def _staging_view(
+        staging: torch.Tensor,
+        kv_dim_before_num_blocks: bool,
+        num_blocks: int,
+    ) -> torch.Tensor:
+        block_dim = 1 if kv_dim_before_num_blocks else 0
+        if num_blocks > staging.shape[block_dim]:
+            raise ValueError(
+                f"CPU KV staging capacity {staging.shape[block_dim]} is "
+                f"smaller than transfer size {num_blocks}"
+            )
+        return staging.narrow(block_dim, 0, num_blocks)
+
+    def _prepare_staging_reuse(self, direction: str) -> None:
+        active_job = self.active_staging_job[direction]
+        if active_job is None:
+            return
+        events = self.transfer_events.get(active_job)
+        if events is not None:
+            events[1].synchronize()
+            if direction == "d2h":
+                self._finalize_staging(active_job)
+        self.active_staging_job[direction] = None
+
+    @staticmethod
+    def _gather_to_staging(
+        src: torch.Tensor,
+        staging: torch.Tensor,
+        block_ids: torch.Tensor,
+        kv_dim_before_num_blocks: bool,
+    ) -> None:
+        if kv_dim_before_num_blocks:
+            torch.index_select(src[0], 0, block_ids, out=staging[0])
+            torch.index_select(src[1], 0, block_ids, out=staging[1])
+        else:
+            torch.index_select(src, 0, block_ids, out=staging)
+
+    @staticmethod
+    def _scatter_from_staging(
+        staging: torch.Tensor,
+        dst: torch.Tensor,
+        block_ids: torch.Tensor,
+        kv_dim_before_num_blocks: bool,
+    ) -> None:
+        if kv_dim_before_num_blocks:
+            dst[0].index_copy_(0, block_ids, staging[0])
+            dst[1].index_copy_(0, block_ids, staging[1])
+        else:
+            dst.index_copy_(0, block_ids, staging)
+
+    def _finalize_staging(self, job_id: int) -> None:
+        for staging, dst, kv_dim, block_ids in self.d2h_postcopies.pop(
+            job_id, []
+        ):
+            self._scatter_from_staging(staging, dst, block_ids, kv_dim)
+        self.staging_refs.pop(job_id, None)
+
+    @staticmethod
+    def _swap_tensor_blocks(
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        mapping: torch.Tensor,
+        kv_dim_before_num_blocks: bool,
+    ) -> None:
+        if kv_dim_before_num_blocks:
+            ops.swap_blocks(src[0], dst[0], mapping)
+            ops.swap_blocks(src[1], dst[1], mapping)
+        else:
+            ops.swap_blocks(src, dst, mapping)
 
     def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
         src_spec, dst_spec = spec
@@ -195,6 +446,22 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         )
         expand_block_ids(dst_blocks, dst_block_size_factor, src_to_dst[:, 1])
         src_to_dst_tensor = torch.from_numpy(src_to_dst)
+        use_staging = self.host_memory_mode == "pageable_lazy"
+        is_h2d = isinstance(src_spec, CPULoadStoreSpec)
+        direction = "h2d" if is_h2d else "d2h"
+        if self.host_memory_mode == "hybrid_pinned_lazy":
+            cpu_column = 0 if is_h2d else 1
+            pinned_mask = src_to_dst[:, cpu_column] < self.pinned_tier_subblocks
+            needs_staging = bool((~pinned_mask).any())
+        else:
+            pinned_mask = None
+            needs_staging = use_staging
+        if needs_staging:
+            self._prepare_staging_reuse(direction)
+        staging_refs: list[torch.Tensor] = []
+        d2h_postcopies: list[
+            tuple[torch.Tensor, torch.Tensor, bool, torch.Tensor]
+        ] = []
 
         if self.events_pool:
             start_event, completion_event = self.events_pool.pop()
@@ -203,25 +470,168 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             completion_event = torch.Event(enable_timing=True)
         with torch.cuda.stream(stream):
             start_event.record(stream)
-            for src_tensor, dst_tensor, kv_dim in zip(
-                src_tensors, dst_tensors, self.kv_dim_before_num_blocks
-            ):
-                if kv_dim:
-                    src_key_cache = src_tensor[0]
-                    dst_key_cache = dst_tensor[0]
-                    ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst_tensor)
-                    src_value_cache = src_tensor[1]
-                    dst_value_cache = dst_tensor[1]
-                    ops.swap_blocks(src_value_cache, dst_value_cache, src_to_dst_tensor)
-                else:
-                    ops.swap_blocks(src_tensor, dst_tensor, src_to_dst_tensor)
+            if self.host_memory_mode == "hybrid_pinned_lazy":
+                assert pinned_mask is not None
+                for tensor_idx, (
+                    gpu_tensor,
+                    pinned_tensor,
+                    lazy_tensor,
+                    kv_dim,
+                ) in enumerate(
+                    zip(
+                        self.gpu_tensors,
+                        self.cpu_pinned_tensors,
+                        self.cpu_lazy_tensors,
+                        self.kv_dim_before_num_blocks,
+                    )
+                ):
+                    if pinned_mask.any():
+                        pinned_mapping = src_to_dst[pinned_mask].copy()
+                        if is_h2d:
+                            transfer_src, transfer_dst = pinned_tensor, gpu_tensor
+                        else:
+                            transfer_src, transfer_dst = gpu_tensor, pinned_tensor
+                        self._swap_tensor_blocks(
+                            transfer_src,
+                            transfer_dst,
+                            torch.from_numpy(pinned_mapping),
+                            kv_dim,
+                        )
+                    lazy_mask = ~pinned_mask
+                    if not lazy_mask.any():
+                        continue
+                    lazy_mapping = src_to_dst[lazy_mask].copy()
+                    lazy_mapping[:, cpu_column] -= self.pinned_tier_subblocks
+                    num_transfer_blocks = int(lazy_mapping.shape[0])
+                    if is_h2d:
+                        staging = self._staging_view(
+                            self.h2d_staging_tensors[tensor_idx],
+                            kv_dim,
+                            num_transfer_blocks,
+                        )
+                        source_ids = torch.from_numpy(lazy_mapping[:, 0].copy())
+                        self._gather_to_staging(
+                            lazy_tensor, staging, source_ids, kv_dim
+                        )
+                        staged_mapping = torch.from_numpy(
+                            np.column_stack(
+                                (
+                                    np.arange(
+                                        num_transfer_blocks, dtype=np.int64
+                                    ),
+                                    lazy_mapping[:, 1],
+                                )
+                            )
+                        )
+                        self._swap_tensor_blocks(
+                            staging, gpu_tensor, staged_mapping, kv_dim
+                        )
+                        staging_refs.append(staging)
+                    else:
+                        staging = self._staging_view(
+                            self.d2h_staging_tensors[tensor_idx],
+                            kv_dim,
+                            num_transfer_blocks,
+                        )
+                        destination_ids = torch.from_numpy(
+                            lazy_mapping[:, 1].copy()
+                        )
+                        staged_mapping = torch.from_numpy(
+                            np.column_stack(
+                                (
+                                    lazy_mapping[:, 0],
+                                    np.arange(
+                                        num_transfer_blocks, dtype=np.int64
+                                    ),
+                                )
+                            )
+                        )
+                        self._swap_tensor_blocks(
+                            gpu_tensor, staging, staged_mapping, kv_dim
+                        )
+                        staging_refs.append(staging)
+                        d2h_postcopies.append(
+                            (staging, lazy_tensor, kv_dim, destination_ids)
+                        )
+            else:
+                for tensor_idx, (src_tensor, dst_tensor, kv_dim) in enumerate(
+                    zip(
+                        src_tensors,
+                        dst_tensors,
+                        self.kv_dim_before_num_blocks,
+                    )
+                ):
+                    transfer_src = src_tensor
+                    transfer_dst = dst_tensor
+                    transfer_mapping = src_to_dst_tensor
+                    if use_staging:
+                        num_transfer_blocks = int(src_to_dst.shape[0])
+                        if is_h2d:
+                            staging = self._staging_view(
+                                self.h2d_staging_tensors[tensor_idx],
+                                kv_dim,
+                                num_transfer_blocks,
+                            )
+                            source_ids = torch.from_numpy(src_to_dst[:, 0].copy())
+                            self._gather_to_staging(
+                                src_tensor, staging, source_ids, kv_dim
+                            )
+                            transfer_src = staging
+                            transfer_mapping = torch.from_numpy(
+                                np.column_stack(
+                                    (
+                                        np.arange(
+                                            num_transfer_blocks, dtype=np.int64
+                                        ),
+                                        src_to_dst[:, 1],
+                                    )
+                                )
+                            )
+                            staging_refs.append(staging)
+                        else:
+                            staging = self._staging_view(
+                                self.d2h_staging_tensors[tensor_idx],
+                                kv_dim,
+                                num_transfer_blocks,
+                            )
+                            destination_ids = torch.from_numpy(
+                                src_to_dst[:, 1].copy()
+                            )
+                            transfer_dst = staging
+                            transfer_mapping = torch.from_numpy(
+                                np.column_stack(
+                                    (
+                                        src_to_dst[:, 0],
+                                        np.arange(
+                                            num_transfer_blocks, dtype=np.int64
+                                        ),
+                                    )
+                                )
+                            )
+                            staging_refs.append(staging)
+                            d2h_postcopies.append(
+                                (staging, dst_tensor, kv_dim, destination_ids)
+                            )
+                    self._swap_tensor_blocks(
+                        transfer_src,
+                        transfer_dst,
+                        transfer_mapping,
+                        kv_dim,
+                    )
             completion_event.record(stream)
 
-        is_h2d = isinstance(src_spec, CPULoadStoreSpec)
+        if staging_refs:
+            self.staging_refs[job_id] = staging_refs
+        if d2h_postcopies:
+            self.d2h_postcopies[job_id] = d2h_postcopies
         if (is_h2d and self.sync_h2d) or (not is_h2d and self.sync_d2h):
             completion_event.synchronize()
+            if not is_h2d:
+                self._finalize_staging(job_id)
 
         self.transfer_events[job_id] = (start_event, completion_event)
+        if needs_staging:
+            self.active_staging_job[direction] = job_id
 
         # success
         return True
@@ -231,6 +641,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         for job_id, events in self.transfer_events.items():
             start_event, completion_event = events
             if completion_event.query():
+                self._finalize_staging(job_id)
                 results.append((job_id, True))
                 self.completed_cuda_duration_s[job_id] = max(
                     0.0, start_event.elapsed_time(completion_event) / 1000.0
@@ -245,6 +656,8 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             events = self.transfer_events.get(job_id)
             if events is not None:
                 events[1].synchronize()
+                if job_id in self.d2h_postcopies:
+                    self._finalize_staging(job_id)
 
     def pop_completed_metrics(self, job_ids: set[int]) -> dict[int, dict[str, float]]:
         return {

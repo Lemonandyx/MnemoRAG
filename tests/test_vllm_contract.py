@@ -18,6 +18,7 @@ def fake_model():
             cache_config=SimpleNamespace(
                 gpu_memory_utilization=0.55,
                 enable_prefix_caching=True,
+                cache_dtype="fp8_e4m3",
             ),
         )
     )
@@ -32,11 +33,14 @@ def test_effective_contract_reads_nested_vllm_config():
             "max_model_len": 2048,
             "gpu_memory_utilization": 0.55,
             "enable_prefix_caching": True,
+            "kv_cache_dtype": "fp8",
         },
     )
 
     assert audit["status"] == "validated"
     assert audit["values"]["max_num_batched_tokens"] == 12288
+    assert audit["values"]["kv_cache_dtype"] == "fp8"
+    assert audit["sources"]["kv_cache_dtype"].endswith(".cache_dtype")
 
 
 def test_effective_contract_rejects_requested_only_configuration():

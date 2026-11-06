@@ -10,6 +10,7 @@ FIELDS = (
     "max_model_len",
     "gpu_memory_utilization",
     "enable_prefix_caching",
+    "kv_cache_dtype",
 )
 CHILDREN = (
     "vllm_config",
@@ -21,6 +22,9 @@ CHILDREN = (
     "engine_core",
     "llm_engine",
 )
+FIELD_ALIASES = {
+    "kv_cache_dtype": ("kv_cache_dtype", "cache_dtype"),
+}
 
 
 def _configuration_objects(root, maximum_depth=4):
@@ -49,19 +53,27 @@ def read_effective_vllm_contract(model) -> dict:
     objects = list(_configuration_objects(model))
     for field in FIELDS:
         for value, path in objects:
-            try:
-                candidate = getattr(value, field, None)
-            except Exception:
-                candidate = None
-            if candidate is not None:
+            for attribute in FIELD_ALIASES.get(field, (field,)):
+                try:
+                    candidate = getattr(value, attribute, None)
+                except Exception:
+                    candidate = None
+                if candidate is None:
+                    continue
                 if field in {"max_num_seqs", "max_num_batched_tokens", "max_model_len"}:
                     candidate = int(candidate)
                 elif field == "gpu_memory_utilization":
                     candidate = float(candidate)
-                else:
+                elif field == "enable_prefix_caching":
                     candidate = bool(candidate)
+                else:
+                    candidate = str(candidate)
+                    if "float8" in candidate or candidate.startswith("fp8_"):
+                        candidate = "fp8"
                 observed[field] = candidate
-                sources[field] = f"{path}.{field}"
+                sources[field] = f"{path}.{attribute}"
+                break
+            if field in observed:
                 break
     return {"values": observed, "sources": sources}
 

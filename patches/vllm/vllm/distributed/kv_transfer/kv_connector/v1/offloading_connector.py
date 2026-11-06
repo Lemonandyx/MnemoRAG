@@ -292,6 +292,25 @@ class OffloadingConnectorScheduler:
             raise ValueError(
                 "VLLM_CPU_KV_H2D_ADAPTIVE_PREFILL_TOKEN_THRESHOLD must be positive"
             )
+        self.document_prefix_only = (
+            os.environ.get("VLLM_CPU_KV_DOCUMENT_PREFIX_ONLY", "0") == "1"
+        )
+        self.min_document_heat_to_store = float(
+            os.environ.get("VLLM_CPU_KV_MIN_DOCUMENT_HEAT_TO_STORE", "1")
+        )
+        if self.min_document_heat_to_store < 1:
+            raise ValueError(
+                "VLLM_CPU_KV_MIN_DOCUMENT_HEAT_TO_STORE must be at least one"
+            )
+        self._document_prefix_limited_requests: set[ReqId] = set()
+        self._tail_blocks_skipped_by_req: dict[ReqId, int] = {}
+        self._tail_blocks_skipped_total = 0
+        self._cold_admission_skipped_requests: set[ReqId] = set()
+        self._cold_admission_blocks_by_req: dict[ReqId, int] = {}
+        self._cold_admission_blocks_skipped_total = 0
+        self._document_heat_observed_requests: set[ReqId] = set()
+        self._document_heat_above_one_requests: set[ReqId] = set()
+        self._document_heat_max_seen = 0.0
 
         self._requests: dict[ReqId, Request] = {}
         # list of GPU block IDs per request
@@ -301,10 +320,17 @@ class OffloadingConnectorScheduler:
         # request blocks are stored in order
         # index of next block (of size offloaded_block_size) to offload
         self._next_stored_block_idx: dict[ReqId, int] = {}
+        # Local prefix length observed during connector lookup. In synchronous
+        # mode allocate_slots also reserves blocks for compute in the same step,
+        # so block hashes alone cannot distinguish local hits from new work.
+        self._load_start_tokens: dict[ReqId, int] = {}
 
         # request ID -> set(block hashes being stored/load)
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
+        # Sync loads are consumed in the same model step. They must not be
+        # re-enqueued through WAITING_FOR_REMOTE_KVS on the next scheduler step.
+        self._sync_load_req_ids: set[ReqId] = set()
         self._h2d_wait_started_s: dict[ReqId, float] = {}
         self._worker_duration_samples: dict[bool, deque[float]] = {
             False: deque(maxlen=4096),
@@ -362,7 +388,7 @@ class OffloadingConnectorScheduler:
             stats["scheduled_spec_units"] += max(
                 len(src_spec.block_ids), len(dst_spec.block_ids)
             )
-            if not store:
+            if not store and getattr(self, "h2d_scheduling", "async") != "sync":
                 self._h2d_wait_started_s.setdefault(req_id, now)
 
     def _record_h2d_wait_finish(self, req_id: ReqId) -> None:
@@ -478,7 +504,36 @@ class OffloadingConnectorScheduler:
                 "submission until completion polling observes the job; H2D "
                 "also reports metadata-to-scheduler completion wait, adaptive "
                 "post-forward defer delay, and explicit blocking wait"
-            )
+            ),
+            "d2h_admission": {
+                "document_prefix_only": getattr(
+                    self, "document_prefix_only", False
+                ),
+                "limited_requests": len(
+                    getattr(self, "_document_prefix_limited_requests", ())
+                ),
+                "tail_blocks_skipped": getattr(
+                    self, "_tail_blocks_skipped_total", 0
+                ),
+                "min_document_heat_to_store": getattr(
+                    self, "min_document_heat_to_store", 1.0
+                ),
+                "cold_admission_skipped_requests": len(
+                    getattr(self, "_cold_admission_skipped_requests", ())
+                ),
+                "cold_admission_blocks_skipped": getattr(
+                    self, "_cold_admission_blocks_skipped_total", 0
+                ),
+                "document_heat_observed_requests": len(
+                    getattr(self, "_document_heat_observed_requests", ())
+                ),
+                "document_heat_above_one_requests": len(
+                    getattr(self, "_document_heat_above_one_requests", ())
+                ),
+                "document_heat_max_seen": getattr(
+                    self, "_document_heat_max_seen", 0.0
+                ),
+            },
         }
         for store, name in ((False, "h2d_reload"), (True, "d2h_offload")):
             stats = dict(self._transfer_stats[store])
@@ -549,6 +604,22 @@ class OffloadingConnectorScheduler:
             self.block_size_factor,
         )
 
+    def _document_prefix_block_limit(self, request: Request) -> int:
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        spans = extra_args.get("mnemorag_document_heat_spans") or ()
+        if not spans:
+            return 0
+        final_document_token = max(int(span[1]) for span in spans)
+        return max(0, final_document_token // self.offloaded_block_size)
+
+    @staticmethod
+    def _document_max_heat(request: Request) -> float:
+        sampling_params = getattr(request, "sampling_params", None)
+        extra_args = getattr(sampling_params, "extra_args", None) or {}
+        spans = extra_args.get("mnemorag_document_heat_spans") or ()
+        return max((float(span[2]) for span in spans), default=0.0)
+
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int, bool]:
@@ -599,7 +670,11 @@ class OffloadingConnectorScheduler:
         if num_hit_tokens < self.offloaded_block_size:
             return 0, False
 
-        return num_hit_tokens, True
+        load_async = self.h2d_scheduling != "sync"
+        self._load_start_tokens[request.request_id] = num_computed_tokens
+        if not load_async:
+            self._sync_load_req_ids.add(request.request_id)
+        return num_hit_tokens, load_async
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
@@ -614,15 +689,29 @@ class OffloadingConnectorScheduler:
         block_groups = blocks.get_block_ids()
         block_ids = block_groups[0]
 
-        num_computed_gpu_blocks = sum(
-            block.block_hash is not None for block in blocks.blocks[0]
+        num_computed_tokens = self._load_start_tokens.pop(
+            request.request_id, None
         )
-        num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
+        if num_computed_tokens is None:
+            # Compatibility fallback for connectors restored from older state.
+            num_computed_gpu_blocks = sum(
+                block.block_hash is not None for block in blocks.blocks[0]
+            )
+            num_computed_tokens = num_computed_gpu_blocks * self.gpu_block_size
+        else:
+            num_computed_gpu_blocks, remainder = divmod(
+                num_computed_tokens, self.gpu_block_size
+            )
+            assert remainder == 0
         full_block_tokens = num_computed_tokens + num_external_tokens
         assert full_block_tokens % self.offloaded_block_size == 0
 
         num_pending_gpu_blocks = len(block_ids) - num_computed_gpu_blocks
-        assert num_external_tokens == num_pending_gpu_blocks * self.gpu_block_size
+        num_external_gpu_blocks, remainder = divmod(
+            num_external_tokens, self.gpu_block_size
+        )
+        assert remainder == 0
+        assert num_external_gpu_blocks <= num_pending_gpu_blocks
 
         start_block_idx = num_computed_tokens // self.offloaded_block_size
         num_blocks = full_block_tokens // self.offloaded_block_size
@@ -633,7 +722,10 @@ class OffloadingConnectorScheduler:
         )
 
         src_spec = self.manager.prepare_load(block_hashes)
-        dst_spec = GPULoadStoreSpec(block_ids[num_computed_gpu_blocks:])
+        external_end_idx = num_computed_gpu_blocks + num_external_gpu_blocks
+        dst_spec = GPULoadStoreSpec(
+            block_ids[num_computed_gpu_blocks:external_end_idx]
+        )
 
         block_hashes = self._get_block_hashes(
             request, start_idx=start_block_idx, end_idx=num_blocks
@@ -661,7 +753,39 @@ class OffloadingConnectorScheduler:
             expected_tokens = req.num_computed_tokens + new_tokens
             # With async scheduling, some tokens may be missing.
             total_tokens = min(expected_tokens, req.num_tokens)
-            num_blocks = total_tokens // self.offloaded_block_size
+            uncapped_num_blocks = total_tokens // self.offloaded_block_size
+            num_blocks = uncapped_num_blocks
+            document_heat = self._document_max_heat(req)
+            self._document_heat_observed_requests.add(req_id)
+            if document_heat > 1.0:
+                self._document_heat_above_one_requests.add(req_id)
+            self._document_heat_max_seen = max(
+                self._document_heat_max_seen, document_heat
+            )
+            if document_heat < self.min_document_heat_to_store:
+                num_blocks = 0
+                skipped = uncapped_num_blocks
+                previous_skipped = self._cold_admission_blocks_by_req.get(
+                    req_id, 0
+                )
+                if skipped > previous_skipped:
+                    self._cold_admission_blocks_skipped_total += (
+                        skipped - previous_skipped
+                    )
+                    self._cold_admission_blocks_by_req[req_id] = skipped
+                if skipped:
+                    self._cold_admission_skipped_requests.add(req_id)
+            elif self.document_prefix_only:
+                num_blocks = min(
+                    num_blocks, self._document_prefix_block_limit(req)
+                )
+                skipped = uncapped_num_blocks - num_blocks
+                previous_skipped = self._tail_blocks_skipped_by_req.get(req_id, 0)
+                if skipped > previous_skipped:
+                    self._tail_blocks_skipped_total += skipped - previous_skipped
+                    self._tail_blocks_skipped_by_req[req_id] = skipped
+                if skipped:
+                    self._document_prefix_limited_requests.add(req_id)
             start_block_idx = self._next_stored_block_idx.get(req_id, 0)
             num_new_blocks = num_blocks - start_block_idx
 
@@ -773,11 +897,23 @@ class OffloadingConnectorScheduler:
             if block_hashes:
                 self.manager.complete_store(block_hashes)
 
+        sync_finished: set[ReqId] = set()
         for req_id in connector_output.finished_recving or []:
             self._record_h2d_wait_finish(req_id)
             block_hashes = self._reqs_being_loaded.pop(req_id, None)
             if block_hashes:
                 self.manager.complete_load(block_hashes)
+            if req_id in self._sync_load_req_ids:
+                self._sync_load_req_ids.remove(req_id)
+                sync_finished.add(req_id)
+
+        if sync_finished and connector_output.finished_recving is not None:
+            # Scheduler.update_from_output runs after this callback. Hide
+            # same-step sync completions so it does not retain them as remote
+            # receives for requests that are already RUNNING.
+            connector_output.finished_recving = set(
+                connector_output.finished_recving
+            ) - sync_finished
 
     def request_finished(
         self,
@@ -797,6 +933,10 @@ class OffloadingConnectorScheduler:
         req_id = request.request_id
         self._requests.pop(req_id, None)
         self._request_block_ids.pop(req_id, None)
+        self._sync_load_req_ids.discard(req_id)
+        self._load_start_tokens.pop(req_id, None)
+        self._tail_blocks_skipped_by_req.pop(req_id, None)
+        self._cold_admission_blocks_by_req.pop(req_id, None)
 
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
@@ -847,10 +987,19 @@ class OffloadingConnectorWorker:
             )
             == "1"
         )
+        self.h2d_max_group_requests = int(
+            os.environ.get("VLLM_CPU_KV_H2D_MAX_GROUP_REQUESTS", "0")
+        )
+        if self.h2d_max_group_requests < 0:
+            raise ValueError(
+                "VLLM_CPU_KV_H2D_MAX_GROUP_REQUESTS must be nonnegative"
+            )
         logger.info(
-            "[MnemoRAG] CPU KV batch transfers per scheduler step: h2d=%s, d2h=%s",
+            "[MnemoRAG] CPU KV batch transfers per scheduler step: "
+            "h2d=%s, d2h=%s, h2d_max_group_requests=%d",
             self.batch_h2d_transfers,
             self.batch_d2h_transfers,
+            self.h2d_max_group_requests,
         )
 
         self._job_counter = 0
@@ -978,13 +1127,19 @@ class OffloadingConnectorWorker:
         job_ids: list[int] = []
         if self.batch_h2d_transfers:
             req_ids = tuple(metadata.reqs_to_load)
-            job_id = self._start_transfer(
-                req_ids,
-                [metadata.reqs_to_load[req_id] for req_id in req_ids],
-                store=False,
-            )
-            if job_id is not None:
-                job_ids.append(job_id)
+            group_size = self.h2d_max_group_requests or len(req_ids)
+            for start in range(0, len(req_ids), group_size):
+                group_req_ids = req_ids[start : start + group_size]
+                job_id = self._start_transfer(
+                    group_req_ids,
+                    [
+                        metadata.reqs_to_load[req_id]
+                        for req_id in group_req_ids
+                    ],
+                    store=False,
+                )
+                if job_id is not None:
+                    job_ids.append(job_id)
             return job_ids
         for req_id, transfer_spec in metadata.reqs_to_load.items():
             job_id = self._start_transfer((req_id,), [transfer_spec], store=False)

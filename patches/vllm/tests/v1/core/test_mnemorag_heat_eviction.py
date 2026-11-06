@@ -2,7 +2,6 @@ import math
 from types import SimpleNamespace
 
 import pytest
-
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
 
@@ -14,6 +13,8 @@ def _queue(monkeypatch, half_life_s=10.0, size=3):
     monkeypatch.delenv("VLLM_KV_HEAT_PURE_LFU", raising=False)
     monkeypatch.delenv("VLLM_KV_PROFILE_NEXT_USE_PATH", raising=False)
     monkeypatch.delenv("VLLM_KV_ORACLE_NEXT_USE_PATH", raising=False)
+    monkeypatch.delenv("VLLM_KV_PROFILE_OBSERVE_ONLY", raising=False)
+    monkeypatch.delenv("VLLM_KV_PROFILE_PRIORITY_MODE", raising=False)
     return FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(size)])
 
 
@@ -73,6 +74,110 @@ def test_heat_policy_rejects_nonpositive_half_life(monkeypatch):
 
     with pytest.raises(ValueError, match="must be positive"):
         FreeKVCacheBlockQueue([KVCacheBlock(0)])
+
+
+def test_legacy_heat_formula_guards_zero_timestamp(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_HEAT_FORMULA", "legacy_log_denominator")
+    queue = _queue(monkeypatch, size=1)
+    block = queue.popleft()
+    block.heat = 4
+    block.last_used_ts = 0.0
+
+    priority = queue.calc_priority(block)
+
+    assert math.isfinite(priority)
+    assert priority > 0
+    assert queue.heat_formula == "legacy_log_denominator"
+    assert queue.legacy_zero_guard_calls == 1
+
+
+def test_legacy_compatibility_flag_selects_old_formula(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_HEAT_LEGACY_TIMESTAMP_SCORE", "1")
+    queue = _queue(monkeypatch, size=1)
+
+    assert queue.heat_formula == "legacy_log_denominator"
+
+
+def test_profile_uses_formula_as_bounded_tiebreak(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_PROFILE_NEXT_USE_PATH", "/audit/profile.json")
+    monkeypatch.setenv("VLLM_KV_PROFILE_PRIORITY_MODE", "formula_tiebreak")
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(3)])
+    first = queue.popleft()
+    second = queue.popleft()
+    later = queue.popleft()
+    first.oracle_next_use_request = 100.0
+    second.oracle_next_use_request = 100.0
+    later.oracle_next_use_request = 99.0
+    _replace(queue, first, heat=1, last_used_ts=10.0)
+    _replace(queue, second, heat=4, last_used_ts=10.0)
+    _replace(queue, later, heat=1, last_used_ts=10.0)
+
+    assert queue.calc_priority(first) < queue.calc_priority(second)
+    assert queue.calc_priority(second) < queue.calc_priority(later)
+    eviction_count_before = queue.profile_formula_tiebreak_evictions
+    assert queue.popleft() is first
+    assert queue.profile_formula_tiebreak_calls > 0
+    assert queue.profile_formula_tiebreak_evictions == eviction_count_before + 1
+
+
+def test_profile_formula_tiebreak_executes_legacy_formula(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_PROFILE_NEXT_USE_PATH", "/audit/profile.json")
+    monkeypatch.setenv("VLLM_KV_HEAT_FORMULA", "legacy_log_denominator")
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(2)])
+    first = queue.popleft()
+    second = queue.popleft()
+    first.oracle_next_use_request = second.oracle_next_use_request = 10.0
+    _replace(queue, first, heat=1, last_used_ts=0.0)
+    _replace(queue, second, heat=2, last_used_ts=1.0)
+
+    eviction_count_before = queue.profile_formula_tiebreak_evictions
+    assert queue.popleft() is second
+    assert queue.heat_formula == "legacy_log_denominator"
+    assert queue.heat_formula_priority_calls > 0
+    assert queue.legacy_zero_guard_calls > 0
+    assert queue.profile_formula_tiebreak_evictions == eviction_count_before + 1
+
+
+def test_legacy_heat_formula_uses_explicit_time_scale(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_HEAT_FORMULA", "legacy_log_denominator")
+    monkeypatch.setenv("VLLM_KV_HEAT_LEGACY_TIME_SCALE_S", "10")
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(0)])
+    block = queue.popleft()
+    _replace(queue, block, heat=2, last_used_ts=10.0)
+
+    assert queue.calc_priority(block) == pytest.approx(2 / math.log(2))
+    assert queue.legacy_time_scale_s == 10
+
+
+def test_profile_only_mode_is_explicit_and_auditable(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_PROFILE_NEXT_USE_PATH", "/audit/profile.json")
+    monkeypatch.setenv("VLLM_KV_PROFILE_PRIORITY_MODE", "profile_only")
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(0)])
+    block = queue.popleft()
+    block.oracle_next_use_request = 5.0
+    _replace(queue, block, heat=4, last_used_ts=10.0)
+
+    assert queue.calc_priority(block) == -5.0
+    assert queue.profile_priority_mode == "profile_only"
+    assert queue.profile_formula_tiebreak_calls == 0
+
+
+def test_observation_profile_does_not_change_heat_eviction(monkeypatch):
+    monkeypatch.setenv("VLLM_KV_FREE_BLOCK_POLICY", "heat")
+    monkeypatch.setenv("VLLM_KV_PROFILE_NEXT_USE_PATH", "/audit/only.json")
+    monkeypatch.setenv("VLLM_KV_PROFILE_OBSERVE_ONLY", "1")
+    queue = FreeKVCacheBlockQueue([KVCacheBlock(i) for i in range(2)])
+    colder = queue.popleft()
+    hotter = queue.popleft()
+    colder.oracle_next_use_request = 1.0
+    hotter.oracle_next_use_request = float("inf")
+    _replace(queue, colder, heat=1, last_used_ts=10.0)
+    _replace(queue, hotter, heat=4, last_used_ts=10.0)
+
+    assert queue.profile_next_use_configured is True
+    assert queue.profile_next_use_observe_only is True
+    assert queue.profile_next_use is False
+    assert queue.popleft() is colder
 
 
 def test_heat_heap_compaction_bounds_stale_entries(monkeypatch):
