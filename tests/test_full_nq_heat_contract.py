@@ -53,7 +53,7 @@ def valid_summary(formula="exponential_decay"):
         "kv_cache_stats": {
             "heat_formula": formula,
             "heat_formula_priority_calls": 10,
-            "legacy_zero_guard_calls": 1,
+            "legacy_zero_guard_calls": 0,
             "legacy_time_scale_s": 1.0,
             "profile_priority_mode": "formula_tiebreak",
             "profile_formula_tiebreak_calls": 10,
@@ -116,6 +116,23 @@ def test_cumulative_rate_cannot_substitute_for_figure14_periodic_metric():
 
     assert not result["passed"]
     assert not result["checks"]["figure14_average_target"]
+
+
+def test_legacy_contract_requires_zero_guard_instrumentation():
+    summary = valid_summary("legacy_log_denominator")
+    del summary["kv_cache_stats"]["legacy_zero_guard_calls"]
+
+    result = validate_formula_summary(
+        summary,
+        "legacy_log_denominator",
+        REQUESTS,
+        0.225027,
+        0.281,
+        0.03,
+    )
+
+    assert not result["passed"]
+    assert not result["checks"]["legacy_zero_guard_instrumented"]
 
 
 def test_periodic_metric_reconstruction_verifies_raw_artifact(

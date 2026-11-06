@@ -465,8 +465,14 @@ def validate_formula_summary(
         "figure14_maximum_target": (
             abs(periodic_max - figure14_max_target) <= tolerance
         ),
-        "legacy_zero_guard": formula != "legacy_log_denominator"
-        or int(stats.get("legacy_zero_guard_calls", 0)) > 0,
+        # A real workload need not observe an exactly-zero elapsed time. The
+        # guard is covered by the zero-delta unit test; the formal run requires
+        # its runtime counter to be present and well-formed, even when it is 0.
+        "legacy_zero_guard_instrumented": formula != "legacy_log_denominator"
+        or (
+            "legacy_zero_guard_calls" in stats
+            and int(stats["legacy_zero_guard_calls"]) >= 0
+        ),
     }
     return {
         "formula": formula,
