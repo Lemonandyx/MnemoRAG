@@ -405,7 +405,7 @@ def main() -> None:
             command = common_command(args, output_dir) + [
                 "--campaign-order-position", str(order),
                 "--kv-heat-formula", formula,
-                "--cpu-kv-cache-gib", str(130_000 * 2_097_152 / 1024**3),
+                "--cpu-kv-cache-gib", str(130_000 * 1_048_576 / 1024**3),
                 "--cpu-kv-num-blocks", "130000",
                 "--cpu-kv-block-size", "16",
                 "--cpu-kv-eviction-policy", "lru",
