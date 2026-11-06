@@ -1127,7 +1127,9 @@ class OffloadingConnectorWorker:
         job_ids: list[int] = []
         if self.batch_h2d_transfers:
             req_ids = tuple(metadata.reqs_to_load)
-            group_size = self.h2d_max_group_requests or len(req_ids)
+            group_size = (
+                getattr(self, "h2d_max_group_requests", 0) or len(req_ids)
+            )
             for start in range(0, len(req_ids), group_size):
                 group_req_ids = req_ids[start : start + group_size]
                 job_id = self._start_transfer(
