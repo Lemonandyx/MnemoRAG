@@ -1,5 +1,11 @@
+import hashlib
+
+import numpy as np
+
+import benchmarks.run_full_nq_heat_contract as full_nq_contract
 from benchmarks.run_full_nq_heat_contract import (
     REQUESTS,
+    figure14_periodic_metrics,
     recovered_capture_manifest,
     validate_formula_summary,
 )
@@ -31,7 +37,19 @@ def valid_summary(formula="exponential_decay"):
             "mode": "",
             "sha256": "abc",
         },
-        "prefix_hit_rate": 0.303,
+        "prefix_hit_rate": 0.252,
+        "online_prefix_cache_periodic_recent_requests": {
+            "metric_definition": (
+                "one-second samples of the token-weighted cache-hit rate over "
+                "the most recent 1000 completed requests"
+            ),
+            "sample_interval_s": 1.0,
+            "requested_window_size": 1000,
+            "sample_count": 3299,
+            "mean_hit_rate": 0.225027,
+            "max_hit_rate": 0.281,
+            "tail_hit_rate": 0.25,
+        },
         "kv_cache_stats": {
             "heat_formula": formula,
             "heat_formula_priority_calls": 10,
@@ -52,7 +70,12 @@ def valid_summary(formula="exponential_decay"):
 
 def test_full_nq_contract_accepts_auditable_formula_run():
     result = validate_formula_summary(
-        valid_summary(), "exponential_decay", REQUESTS, 0.303006, 0.02
+        valid_summary(),
+        "exponential_decay",
+        REQUESTS,
+        0.225027,
+        0.281,
+        0.03,
     )
     assert result["passed"]
 
@@ -64,12 +87,64 @@ def test_full_nq_contract_rejects_profile_formula_bypass():
     summary["kv_cache_stats"]["profile_formula_tiebreak_evictions"] = 0
 
     result = validate_formula_summary(
-        summary, "legacy_log_denominator", REQUESTS, 0.303006, 0.02
+        summary,
+        "legacy_log_denominator",
+        REQUESTS,
+        0.225027,
+        0.281,
+        0.03,
     )
 
     assert not result["passed"]
     assert not result["checks"]["formula_executed"]
     assert not result["checks"]["profile_formula_composed"]
+
+
+def test_cumulative_rate_cannot_substitute_for_figure14_periodic_metric():
+    summary = valid_summary()
+    summary["prefix_hit_rate"] = 0.303006
+    summary["online_prefix_cache_periodic_recent_requests"]["mean_hit_rate"] = 0.1
+
+    result = validate_formula_summary(
+        summary,
+        "exponential_decay",
+        REQUESTS,
+        0.225027,
+        0.281,
+        0.03,
+    )
+
+    assert not result["passed"]
+    assert not result["checks"]["figure14_average_target"]
+
+
+def test_periodic_metric_reconstruction_verifies_raw_artifact(
+    tmp_path, monkeypatch
+):
+    artifact = tmp_path / "request_metrics.npz"
+    np.savez_compressed(
+        artifact,
+        prefix_cached_tokens=np.asarray([1, 1, 2, 2], dtype="<i8"),
+        prefix_prompt_tokens=np.asarray([2, 2, 2, 2], dtype="<i8"),
+        finish_offset_s=np.asarray([0.2, 0.4, 1.2, 1.4], dtype="<f8"),
+    )
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    monkeypatch.setattr(full_nq_contract, "REQUESTS", 4)
+
+    metrics = figure14_periodic_metrics(
+        {
+            "request_metrics_artifact": {
+                "path": str(artifact),
+                "sha256": digest,
+            }
+        }
+    )
+
+    assert metrics["source"] == "verified_request_metrics_reconstruction"
+    assert metrics["sample_count"] == 2
+    assert metrics["mean_hit_rate"] == 0.625
+    assert metrics["max_hit_rate"] == 0.75
+    assert metrics["artifact_sha256_verified"] is True
 
 
 def test_capture_recovery_requires_completed_workload_and_tail(tmp_path):

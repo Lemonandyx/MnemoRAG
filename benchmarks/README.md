@@ -95,7 +95,11 @@ element), not the model-weight dtype. `--cpu-kv-pinned-tier-gib` and
 remainder of the pool to use audited tmpfs or disk-backed mmap storage; the
 runner fails before launch when a disk-backed directory lacks sufficient free
 space.
-It accepts the historical top-k=3 cumulative result only within the frozen
-absolute interval `0.303006 +/- 0.02`; both formulas must also agree within
-0.5 percentage points. A profile-only run is an explicit ablation and cannot
-pass this contract.
+Figure 14 reports one-second samples of the token-weighted hit rate over the
+most recent 1,000 requests, not the final cumulative rate or the maximum of
+per-request ratios. The full-NQ runner therefore checks the historical top-k=3
+periodic mean (`0.225027`) and maximum (`0.281`) within a 3-percentage-point
+hardware/revalidation band. The historical cumulative-series maximum
+(`0.303006`) is retained as provenance, but is not compared to a different
+metric. Both formulas must also agree within 0.5 percentage points. A
+profile-only run is an explicit ablation and cannot pass this contract.

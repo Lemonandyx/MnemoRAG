@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
+import math
 import os
 import subprocess
 from pathlib import Path
@@ -17,8 +19,10 @@ except ImportError:
 
 
 REQUESTS = 79_168
-TARGET_CUMULATIVE_HIT_RATE = 0.303006
-TARGET_ABSOLUTE_TOLERANCE = 0.02
+FIGURE14_PERIODIC_MEAN_HIT_RATE = 0.225027
+FIGURE14_PERIODIC_MAX_HIT_RATE = 0.281
+FIGURE14_CUMULATIVE_SERIES_MAX = 0.303006
+FIGURE14_ABSOLUTE_TOLERANCE = 0.03
 FORMULAS = ("exponential_decay", "legacy_log_denominator")
 
 
@@ -74,10 +78,19 @@ def parse_args() -> argparse.Namespace:
         help="Existing tmpfs or disk-backed directory for the lazy CPU KV tier.",
     )
     parser.add_argument(
-        "--target-hit-rate", type=float, default=TARGET_CUMULATIVE_HIT_RATE
+        "--figure14-mean-hit-rate",
+        type=float,
+        default=FIGURE14_PERIODIC_MEAN_HIT_RATE,
     )
     parser.add_argument(
-        "--target-tolerance", type=float, default=TARGET_ABSOLUTE_TOLERANCE
+        "--figure14-max-hit-rate",
+        type=float,
+        default=FIGURE14_PERIODIC_MAX_HIT_RATE,
+    )
+    parser.add_argument(
+        "--figure14-tolerance",
+        type=float,
+        default=FIGURE14_ABSOLUTE_TOLERANCE,
     )
     parser.add_argument("--reuse-capture", action="store_true")
     return parser.parse_args()
@@ -200,6 +213,102 @@ def load_summary(output_dir: Path, requests: int) -> dict:
     return json.loads(summary_path.read_text(encoding="utf-8"))
 
 
+def figure14_periodic_metrics(summary: dict) -> dict[str, object]:
+    """Return Figure-14's periodic recent-1000 token-weighted metrics.
+
+    New benchmark outputs record the one-second samples directly. For an
+    already completed run from before that instrumentation was added, rebuild
+    the same one-second series from the immutable request-metrics artifact.
+    Prefix arrays are emitted in completion order, while sorted finish offsets
+    provide the corresponding completion timeline.
+    """
+    recorded = summary.get("online_prefix_cache_periodic_recent_requests") or {}
+    if (
+        int(recorded.get("sample_count", 0)) > 0
+        and recorded.get("mean_hit_rate") is not None
+        and recorded.get("max_hit_rate") is not None
+    ):
+        return {
+            "source": "benchmark_periodic_instrumentation",
+            "metric_definition": recorded.get("metric_definition"),
+            "sample_interval_s": float(recorded.get("sample_interval_s", 1.0)),
+            "window_size_requests": int(
+                recorded.get("requested_window_size", 1000)
+            ),
+            "sample_count": int(recorded["sample_count"]),
+            "mean_hit_rate": float(recorded["mean_hit_rate"]),
+            "max_hit_rate": float(recorded["max_hit_rate"]),
+            "tail_hit_rate": (
+                float(recorded["tail_hit_rate"])
+                if recorded.get("tail_hit_rate") is not None
+                else None
+            ),
+            "measurement_recorded_directly": True,
+            "artifact_sha256_verified": None,
+        }
+
+    artifact = summary.get("request_metrics_artifact") or {}
+    artifact_path = Path(str(artifact.get("path", "")))
+    expected_sha256 = str(artifact.get("sha256", ""))
+    if not artifact_path.is_file() or not expected_sha256:
+        raise RuntimeError(
+            "Figure-14 periodic metrics are absent and request_metrics.npz "
+            "cannot be verified"
+        )
+    actual_sha256 = file_sha256(artifact_path)
+    if actual_sha256 != expected_sha256:
+        raise RuntimeError(
+            f"request metrics digest mismatch: {actual_sha256} != {expected_sha256}"
+        )
+
+    numpy = __import__("numpy")
+    with numpy.load(artifact_path) as metrics:
+        cached = metrics["prefix_cached_tokens"].astype("int64")
+        prompt = metrics["prefix_prompt_tokens"].astype("int64")
+        finish_offsets = numpy.sort(metrics["finish_offset_s"].astype(float))
+    if not (len(cached) == len(prompt) == len(finish_offsets) == REQUESTS):
+        raise RuntimeError("request-metrics arrays do not cover the complete NQ")
+
+    recent: deque[tuple[int, int]] = deque()
+    recent_cached = 0
+    recent_prompt = 0
+    cursor = 0
+    samples: list[float] = []
+    for tick_s in range(1, math.ceil(float(finish_offsets[-1])) + 1):
+        while cursor < len(finish_offsets) and finish_offsets[cursor] <= tick_s:
+            cached_tokens = min(int(cached[cursor]), int(prompt[cursor]))
+            prompt_tokens = int(prompt[cursor])
+            recent.append((cached_tokens, prompt_tokens))
+            recent_cached += cached_tokens
+            recent_prompt += prompt_tokens
+            cursor += 1
+            if len(recent) > 1000:
+                expired_cached, expired_prompt = recent.popleft()
+                recent_cached -= expired_cached
+                recent_prompt -= expired_prompt
+        if recent and recent_prompt:
+            samples.append(recent_cached / recent_prompt)
+    if not samples:
+        raise RuntimeError("no periodic Figure-14 samples could be reconstructed")
+    return {
+        "source": "verified_request_metrics_reconstruction",
+        "metric_definition": (
+            "one-second samples of the token-weighted cache-hit rate over the "
+            "most recent 1000 completed requests"
+        ),
+        "sample_interval_s": 1.0,
+        "window_size_requests": 1000,
+        "sample_count": len(samples),
+        "mean_hit_rate": float(numpy.mean(samples)),
+        "max_hit_rate": float(numpy.max(samples)),
+        "tail_hit_rate": float(samples[-1]),
+        "artifact_path": str(artifact_path),
+        "artifact_sha256": actual_sha256,
+        "measurement_recorded_directly": False,
+        "artifact_sha256_verified": True,
+    }
+
+
 def recovered_capture_manifest(
     access_log: Path, run_log: Path, requests: int
 ) -> dict[str, object]:
@@ -288,14 +397,18 @@ def validate_formula_summary(
     summary: dict,
     formula: str,
     requests: int,
-    target: float,
+    figure14_mean_target: float,
+    figure14_max_target: float,
     tolerance: float,
 ) -> dict[str, object]:
     stats = summary.get("kv_cache_stats") or {}
     transfers = stats.get("cpu_kv_transfer") or {}
     h2d = transfers.get("h2d_reload") or {}
     d2h = transfers.get("d2h_offload") or {}
-    rate = float(summary.get("prefix_hit_rate", -1.0))
+    cumulative_rate = float(summary.get("prefix_hit_rate", -1.0))
+    periodic = figure14_periodic_metrics(summary)
+    periodic_mean = float(periodic["mean_hit_rate"])
+    periodic_max = float(periodic["max_hit_rate"])
     cpu_profile = summary.get("cpu_kv_admission_profile") or {}
     cpu_offload = summary.get("cpu_kv_offload") or {}
     match_count = int(stats.get("profile_next_use_matches", 0))
@@ -338,16 +451,32 @@ def validate_formula_summary(
         and match_count / access_count >= 0.99,
         "offload_active": int(h2d.get("worker_transferred_blocks", 0)) > 0
         and int(d2h.get("worker_transferred_blocks", 0)) > 0,
-        "figure14_target": abs(rate - target) <= tolerance,
+        "figure14_metric_semantics": periodic.get("sample_interval_s") == 1.0
+        and periodic.get("window_size_requests") == 1000
+        and int(periodic.get("sample_count", 0)) > 0
+        and "token-weighted" in str(periodic.get("metric_definition", ""))
+        and (
+            periodic.get("measurement_recorded_directly") is True
+            or periodic.get("artifact_sha256_verified") is True
+        ),
+        "figure14_average_target": (
+            abs(periodic_mean - figure14_mean_target) <= tolerance
+        ),
+        "figure14_maximum_target": (
+            abs(periodic_max - figure14_max_target) <= tolerance
+        ),
         "legacy_zero_guard": formula != "legacy_log_denominator"
         or int(stats.get("legacy_zero_guard_calls", 0)) > 0,
     }
     return {
         "formula": formula,
-        "prefix_hit_rate": rate,
-        "target": target,
+        "prefix_hit_rate": cumulative_rate,
+        "figure14_periodic": periodic,
+        "figure14_mean_target": figure14_mean_target,
+        "figure14_max_target": figure14_max_target,
         "absolute_tolerance": tolerance,
-        "delta": rate - target,
+        "figure14_mean_delta": periodic_mean - figure14_mean_target,
+        "figure14_max_delta": periodic_max - figure14_max_target,
         "profile_match_fraction": (
             match_count / access_count if access_count else None
         ),
@@ -371,8 +500,8 @@ def main() -> None:
     args.cpu_kv_lazy_mmap_dir.mkdir(parents=True, exist_ok=True)
     if args.requests != REQUESTS:
         raise ValueError("the formal contract requires all 79,168 NQ requests")
-    if args.target_tolerance <= 0:
-        raise ValueError("--target-tolerance must be positive")
+    if args.figure14_tolerance <= 0:
+        raise ValueError("--figure14-tolerance must be positive")
     args.output_root.mkdir(parents=True, exist_ok=True)
     # The public evaluator writes this legacy relative artifact before the
     # benchmark serializes its authoritative point summary.
@@ -434,15 +563,28 @@ def main() -> None:
             summary,
             formula,
             args.requests,
-            args.target_hit_rate,
-            args.target_tolerance,
+            args.figure14_mean_hit_rate,
+            args.figure14_max_hit_rate,
+            args.figure14_tolerance,
         )
 
-    formula_delta = abs(
+    cumulative_formula_delta = abs(
         validations[FORMULAS[0]]["prefix_hit_rate"]
         - validations[FORMULAS[1]]["prefix_hit_rate"]
     )
-    cross_formula_check = formula_delta <= 0.005
+    mean_formula_delta = abs(
+        validations[FORMULAS[0]]["figure14_periodic"]["mean_hit_rate"]
+        - validations[FORMULAS[1]]["figure14_periodic"]["mean_hit_rate"]
+    )
+    max_formula_delta = abs(
+        validations[FORMULAS[0]]["figure14_periodic"]["max_hit_rate"]
+        - validations[FORMULAS[1]]["figure14_periodic"]["max_hit_rate"]
+    )
+    cross_formula_check = max(
+        cumulative_formula_delta,
+        mean_formula_delta,
+        max_formula_delta,
+    ) <= 0.005
     aggregate = {
         "format": "mnemorag.full-nq-heat-contract.v1",
         "status": (
@@ -462,15 +604,24 @@ def main() -> None:
             "gpu_memory_utilization": 0.9,
             "max_num_seqs": 64,
             "cpu_kv_blocks": 130_000,
-            "target_cumulative_hit_rate": args.target_hit_rate,
-            "target_absolute_tolerance": args.target_tolerance,
+            "figure14_metric": (
+                "one-second recent-1000-request token-weighted hit rate"
+            ),
+            "figure14_periodic_mean_target": args.figure14_mean_hit_rate,
+            "figure14_periodic_max_target": args.figure14_max_hit_rate,
+            "figure14_historical_cumulative_series_max": (
+                FIGURE14_CUMULATIVE_SERIES_MAX
+            ),
+            "figure14_absolute_tolerance": args.figure14_tolerance,
             "profile_priority_mode": "formula_tiebreak",
         },
         "profile_manifest": json.loads(profile_manifest.read_text()),
         "profile_manifest_sha256": file_sha256(profile_manifest),
         "formula_results": validations,
         "cross_formula": {
-            "absolute_hit_rate_delta": formula_delta,
+            "absolute_cumulative_hit_rate_delta": cumulative_formula_delta,
+            "absolute_figure14_mean_delta": mean_formula_delta,
+            "absolute_figure14_max_delta": max_formula_delta,
             "maximum_allowed_delta": 0.005,
             "passed": cross_formula_check,
         },

@@ -25,7 +25,7 @@ import statistics
 import subprocess
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 # Resource preflight may initialize CUDA before vLLM creates its engine core.
@@ -2329,6 +2329,12 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
     prefix_request_hit_rates: list[float] = []
     prefix_request_cached_tokens: list[int] = []
     prefix_request_prompt_tokens: list[int] = []
+    prefix_periodic_recent_samples: list[dict[str, float | int]] = []
+    prefix_recent_requests: deque[tuple[int, int]] = deque()
+    prefix_recent_cached_tokens = 0
+    prefix_recent_prompt_tokens = 0
+    prefix_periodic_origin_s: float | None = None
+    prefix_next_periodic_sample_s = 1.0
     retrieval_reference_cursor = 0
     if args.record_stage_breakdown or retrieval_reference_ids is not None:
         original_batch_search = pipeline.retriever.batch_search
@@ -2573,14 +2579,55 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             _original=prefix_original_format_outputs,
             **keywords,
         ):
+            nonlocal prefix_recent_cached_tokens
+            nonlocal prefix_recent_prompt_tokens
+            nonlocal prefix_periodic_origin_s
+            nonlocal prefix_next_periodic_sample_s
+            now_s = time.perf_counter()
+            if prefix_periodic_origin_s is None:
+                prefix_periodic_origin_s = now_s
             for output in outputs:
                 prompt_tokens = len(getattr(output, "prompt_token_ids", None) or ())
-                cached_tokens = int(getattr(output, "num_cached_tokens", 0) or 0)
+                cached_tokens = min(
+                    prompt_tokens,
+                    int(getattr(output, "num_cached_tokens", 0) or 0),
+                )
                 prefix_request_hit_rates.append(
                     cached_tokens / prompt_tokens if prompt_tokens else 0.0
                 )
                 prefix_request_cached_tokens.append(cached_tokens)
                 prefix_request_prompt_tokens.append(prompt_tokens)
+                prefix_recent_requests.append((cached_tokens, prompt_tokens))
+                prefix_recent_cached_tokens += cached_tokens
+                prefix_recent_prompt_tokens += prompt_tokens
+                if len(prefix_recent_requests) > 1000:
+                    expired_cached, expired_prompt = (
+                        prefix_recent_requests.popleft()
+                    )
+                    prefix_recent_cached_tokens -= expired_cached
+                    prefix_recent_prompt_tokens -= expired_prompt
+
+            elapsed_s = now_s - prefix_periodic_origin_s
+            if elapsed_s >= prefix_next_periodic_sample_s:
+                prefix_periodic_recent_samples.append(
+                    {
+                        "sample_index": len(prefix_periodic_recent_samples),
+                        "elapsed_s": float(elapsed_s),
+                        "request_count": len(prefix_recent_requests),
+                        "prompt_tokens": int(prefix_recent_prompt_tokens),
+                        "cached_tokens": int(prefix_recent_cached_tokens),
+                        "hit_rate": (
+                            float(
+                                prefix_recent_cached_tokens
+                                / prefix_recent_prompt_tokens
+                            )
+                            if prefix_recent_prompt_tokens
+                            else 0.0
+                        ),
+                    }
+                )
+                while prefix_next_periodic_sample_s <= elapsed_s:
+                    prefix_next_periodic_sample_s += 1.0
             return _original(outputs, *positional, **keywords)
 
         pipeline.generator._format_outputs = prefix_format_outputs
@@ -3192,6 +3239,35 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 requested_window_size=1000,
             )
         ),
+        "online_prefix_cache_periodic_recent_requests": {
+            "metric_definition": (
+                "one-second samples of the token-weighted cache-hit rate over "
+                "the most recent 1000 completed requests"
+            ),
+            "sample_interval_s": 1.0,
+            "requested_window_size": 1000,
+            "sample_count": len(prefix_periodic_recent_samples),
+            "mean_hit_rate": (
+                statistics.fmean(
+                    sample["hit_rate"] for sample in prefix_periodic_recent_samples
+                )
+                if prefix_periodic_recent_samples
+                else None
+            ),
+            "max_hit_rate": (
+                max(
+                    sample["hit_rate"] for sample in prefix_periodic_recent_samples
+                )
+                if prefix_periodic_recent_samples
+                else None
+            ),
+            "tail_hit_rate": (
+                prefix_periodic_recent_samples[-1]["hit_rate"]
+                if prefix_periodic_recent_samples
+                else None
+            ),
+            "samples": prefix_periodic_recent_samples,
+        },
         "kv_cache_stats": kv_cache_stats,
         "kv_cache_stats_total_including_warmup": kv_cache_stats_total,
         "cpu_kv_transfer_latency": cpu_kv_transfer_latency,
