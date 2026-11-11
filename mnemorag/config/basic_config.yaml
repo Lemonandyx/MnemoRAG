@@ -1,0 +1,109 @@
+# Model aliases may be replaced by local paths in an experiment configuration.
+model2path:
+  e5: intfloat/e5-large-v2
+  llama3-8B-instruct: meta-llama/Meta-Llama-3-8B-Instruct
+model2pooling:
+  e5: mean
+method2index:
+  e5: null
+
+# Runtime and output.
+data_dir: dataset
+save_dir: output
+dataset_name: nq
+split: [test]
+test_sample_num: null
+random_sample: false
+seed: 2024
+disable_save: false
+save_intermediate_data: true
+save_metric_score: true
+save_note: experiment
+
+# The paper contract allocates one 64-core CPU socket and one selected GPU.
+gpu_id: 0
+cpu_threads: 64
+faiss_omp_threads: 1
+faiss_search_workers: 64
+faiss_max_codes: 0
+
+# Dense retrieval.
+retrieval_method: e5
+retrieval_model_path: null
+retrieval_pooling_method: null
+index_path: null
+corpus_path: null
+faiss_gpu: false
+instruction: null
+retrieval_topk: 3
+retrieval_batch_size: 64
+retrieval_use_fp16: true
+retrieval_query_max_length: 128
+silent_retrieval: true
+save_retrieval_cache: false
+use_retrieval_cache: false
+retrieval_cache_path: null
+use_sentence_transformer: false
+use_multi_retriever: false
+
+# Optional reranking is disabled in the paper configuration.
+use_reranker: false
+rerank_model_name: null
+rerank_model_path: null
+rerank_pooling_method: null
+rerank_topk: 3
+rerank_max_length: 512
+rerank_batch_size: 256
+rerank_use_fp16: true
+
+# Similarity-aware retrieval and asynchronous scheduling.
+enable_similarity_aware: true
+enable_preassigned_guidance: true
+similarity_t_reuse: 0.95
+similarity_t_guided: 0.85
+# Equation (2): normalize with the running similarity extrema maintained by
+# the Query Base. The threshold-anchored form remains available as an ablation.
+similarity_nprobe_normalization: cumulative
+similarity_nprobe_gamma: 2.0
+similarity_nprobe_curve: power_decay
+similarity_nprobe_min: 16
+similarity_nprobe_max: null
+similarity_nprobe_rounding: ceil
+query_base_capacity: 80000
+query_base_dtype: float16
+query_base_policy: lru
+query_base_retain_metadata: false
+query_base_exact_lookup: true
+document_hotness_dense_counts: true
+enable_document_kv_heat: true
+faiss_mmap_index: false
+# Release retrieval for the next microbatch only after every request in the
+# current microbatch has been admitted to prefill. This keeps one controlled
+# look-ahead slot across concurrent workflow workers.
+async_retrieval_policy: prefill_batch
+async_cross_microbatch_pipeline: true
+direct_vllm_dispatch: false
+async_fixed_delay_ms: 60.0
+async_generation_queue_batches: 2
+async_adaptive_ema_alpha: 0.25
+async_adaptive_max_prefill_overlap_fraction: 0.5
+async_adaptive_safety_margin_ms: 5.0
+async_scheduler_gate_timeout_s: 120.0
+
+# vLLM generation.
+framework: vllm
+generator_model: llama3-8B-instruct
+generator_model_path: null
+generator_max_input_len: 2048
+generator_batch_size: 64
+vllm_persistent_async_engine: true
+gpu_memory_utilization: 0.9
+generation_params:
+  max_tokens: 32
+  temperature: 0.0
+
+# Evaluation.
+metrics: [em, f1, acc, precision, recall, input_tokens]
+metric_setting:
+  retrieval_recall_topk: 3
+  tokenizer_name: gpt-4

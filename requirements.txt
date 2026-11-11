@@ -1,0 +1,12 @@
+# vLLM is installed separately after applying the overlay in patches/vllm/.
+aiohttp
+chonkie
+datasets
+faiss-cpu==1.8.0
+matplotlib
+numpy
+PyYAML
+tiktoken
+torch
+tqdm
+transformers>=4.40.0

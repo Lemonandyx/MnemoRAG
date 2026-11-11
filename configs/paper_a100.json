@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "resource_contract": {
+    "physical_cpu_cores": 64,
+    "gpu_count_per_point": 1,
+    "gpu_model": "NVIDIA A100-SXM4-40GB",
+    "asset_root_env": "MNEMORAG_ASSET_ROOT"
+  },
+  "workload": {
+    "datasets": ["nq", "hotpotqa", "squad", "2wikimultihopqa"],
+    "requests_per_point": 512,
+    "arrival_process": "poisson",
+    "share_sample_and_arrival_trace_across_systems": true,
+    "workflows": ["onepass", "recomp", "irg"],
+    "top_k": 3,
+    "nprobe": [128, 256, 512],
+    "slo_seconds": 10.0,
+    "retain_measurements_above_slo": true
+  },
+  "retrieval": {
+    "retriever": "e5-large-v2",
+    "index": "IVF4096,Flat",
+    "corpus": "Wikipedia-21M",
+    "cpu_threads": 64
+  },
+  "generation": {
+    "model": "llama3-8B-instruct",
+    "frontend": "vllm.AsyncLLMEngine",
+    "dtype": "bfloat16",
+    "max_model_len": 2048,
+    "gpu_memory_utilization": 0.9,
+    "enable_prefix_caching": true,
+    "enable_chunked_prefill": true,
+    "max_num_seqs": 64,
+    "temperature": 0.0,
+    "answer_max_tokens": 32,
+    "fresh_process_per_point": true
+  },
+  "mnemorag": {
+    "similarity_aware_retrieval": true,
+    "similarity_thresholds": {
+      "nq": {"tau_reuse": 0.95, "tau_guided": 0.85},
+      "squad": {"tau_reuse": 0.94, "tau_guided": 0.85},
+      "hotpotqa": {"tau_reuse": 0.93, "tau_guided": 0.80},
+      "2wikimultihopqa": {"tau_reuse": 0.96, "tau_guided": 0.90}
+    },
+    "similarity_normalization": "cumulative_query_base_extrema",
+    "hotness_reordering": true,
+    "ordering_hint": "complete original relevance order at prompt tail",
+    "asynchronous_scheduling": true,
+    "retrieval_release_gate": "all requests in the current microbatch admitted to prefill",
+    "cross_microbatch_lookahead": 1,
+    "generation_queue_capacity_microbatches": 2,
+    "cpu_kv_offload": true,
+    "cpu_kv_connector": "vLLM OffloadingConnector",
+    "kv_policy": "hotness-and-recency-aware GPU tier with bounded CPU tier"
+  }
+}
