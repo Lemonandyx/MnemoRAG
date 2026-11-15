@@ -83,6 +83,9 @@ python -m pip install -e /path/to/vllm
 The patch script checks compatibility before applying the required runtime
 changes.
 
+Faiss uses its standard 1.8.0 APIs and requires no source patch; see
+[`patches/faiss/`](patches/faiss/README.md) for the integration and checks.
+
 ## Data and configuration
 
 Copy [`configs/paper_a100.json`](configs/paper_a100.json) and replace the
