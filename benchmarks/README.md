@@ -26,7 +26,6 @@ point starts in a fresh process and writes its output below an ignored
 | `benchmark_point.py` | Run one isolated MnemoRAG or vanilla serving point |
 | `run_full_e2e_campaign.py` | Run the end-to-end evaluation campaign |
 | `run_retrieval_six_system_four_dataset.py` | Run the retrieval comparison |
-| `run_prefix_campaign.py` | Run the prefix-cache comparison |
 | `run_mnemo_ablation.py` | Run the component ablation |
 
 Examples:
@@ -34,7 +33,6 @@ Examples:
 ```bash
 python -m benchmarks.run_full_e2e_campaign --help
 python -m benchmarks.run_retrieval_six_system_four_dataset --help
-python -m benchmarks.run_prefix_campaign --help
 python -m benchmarks.run_mnemo_ablation --help
 ```
 

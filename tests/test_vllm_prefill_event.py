@@ -17,9 +17,7 @@ def test_prefill_event_uses_engine_scheduler_admission_timestamp():
             request_id="request-0",
             new_token_ids=[],
             events=[
-                EngineCoreEvent.new_event(
-                    EngineCoreEventType.QUEUED, timestamp=10.0
-                ),
+                EngineCoreEvent.new_event(EngineCoreEventType.QUEUED, timestamp=10.0),
                 EngineCoreEvent.new_event(
                     EngineCoreEventType.SCHEDULED, timestamp=12.5
                 ),
@@ -44,9 +42,7 @@ def test_prefill_event_waits_until_scheduled_event_exists():
             request_id="request-0",
             new_token_ids=[],
             events=[
-                EngineCoreEvent.new_event(
-                    EngineCoreEventType.QUEUED, timestamp=10.0
-                )
+                EngineCoreEvent.new_event(EngineCoreEventType.QUEUED, timestamp=10.0)
             ],
         )
 

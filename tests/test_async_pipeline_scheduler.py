@@ -57,6 +57,20 @@ class FakePromptTemplate:
         ]
 
 
+class RecompPrompt:
+    def get_string(
+        self,
+        question,
+        retrieval_result=None,
+        formatted_reference=None,
+        **_,
+    ):
+        reference = (
+            formatted_reference if formatted_reference is not None else retrieval_result
+        )
+        return f"{question}:{reference}"
+
+
 class FakeGenerator:
     use_persistent_async_engine = True
 
@@ -127,12 +141,7 @@ def make_pipeline(
     pipeline = object.__new__(AsyncPipeline)
     pipeline.config = {
         "retrieval_batch_size": 2,
-        "async_fixed_delay_ms": 10.0,
         "async_generation_queue_batches": 2,
-        "async_adaptive_ema_alpha": 1.0,
-        "async_adaptive_max_prefill_overlap_fraction": 0.5,
-        "async_adaptive_safety_margin_ms": 5.0,
-        "direct_vllm_dispatch": False,
     }
     if policy is not None:
         pipeline.config["async_retrieval_policy"] = policy
@@ -148,8 +157,21 @@ def make_pipeline(
 
 
 class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_multistage_failure_releases_cross_batch_lock(self):
+        for workflow in ("run_stream_recomp", "run_stream_irg"):
+            pipeline = make_pipeline("prefill_batch", retrieval_delay=0.001)
+            pipeline.config["async_cross_microbatch_pipeline"] = True
+            pipeline.generator = FailingGenerator()
+            pipeline.reset_cross_microbatch_scheduler()
+            with self.assertRaisesRegex(RuntimeError, "generation failed"):
+                await asyncio.wait_for(
+                    getattr(pipeline, workflow)(FakeDataset(["q0"]), do_eval=False),
+                    timeout=1.0,
+                )
+            self.assertFalse(pipeline._cross_microbatch_lock.locked())
+
     async def test_ready_retrieval_calls_coalesce_without_timed_window(self):
-        pipeline = make_pipeline("eager", retrieval_delay=0.002)
+        pipeline = make_pipeline("prefill_batch", retrieval_delay=0.002)
         pipeline.config["retrieval_batch_size"] = 4
 
         first, second, third = await asyncio.gather(
@@ -169,45 +191,20 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["retriever_batches"], 1)
         self.assertEqual(stats["coalesced_calls"], 2)
 
-    async def test_direct_vllm_dispatch_disables_application_stage_gate(self):
-        pipeline = make_pipeline("prefill_start")
-        pipeline.config.update(
-            {
-                "direct_vllm_dispatch": True,
-                "async_cross_microbatch_pipeline": True,
-            }
-        )
-        pipeline.reset_cross_microbatch_scheduler()
-
-        await asyncio.gather(
-            pipeline.run_stream(FakeDataset(["q0"]), do_eval=False),
-            pipeline.run_stream(FakeDataset(["q1"]), do_eval=False),
-        )
-
-        self.assertEqual(len(pipeline.generator.calls), 2)
-        stats = pipeline.last_async_scheduler_stats
-        self.assertTrue(stats["direct_vllm_dispatch"])
-        self.assertFalse(stats["application_generation_gate"])
-        self.assertEqual(stats["effective_async_retrieval_policy"], "eager")
-
     async def test_default_policy_waits_for_full_batch_prefill_admission(self):
         pipeline = make_pipeline(None)
         dataset = FakeDataset(["q0", "q1"])
 
         await pipeline.run_stream(dataset, do_eval=False)
 
-        self.assertEqual(
-            pipeline.last_async_scheduler_stats["policy"], "prefill_batch"
-        )
+        self.assertEqual(pipeline.last_async_scheduler_stats["policy"], "prefill_batch")
         self.assertTrue(
-            pipeline.generator.calls[0]["generation_params"][
-                "prefill_start_after_all"
-            ]
+            pipeline.generator.calls[0]["generation_params"]["prefill_start_after_all"]
         )
 
     async def test_generation_microbatch_queue_applies_backpressure(self):
         pipeline = make_pipeline(
-            "eager",
+            "prefill_batch",
             retrieval_delay=0.001,
             prefill_delay=0.02,
             decode_delay=0.04,
@@ -225,7 +222,7 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["generation_queue_high_water_batches"], 2)
 
     async def test_recomp_uses_distinct_compression_and_answer_budgets(self):
-        pipeline = make_pipeline("stage_aware")
+        pipeline = make_pipeline("prefill_batch")
         pipeline.config.update(
             {
                 "generation_params": {"max_tokens": 32},
@@ -233,21 +230,6 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
                 "recomp_answer_max_tokens": 32,
             }
         )
-
-        class RecompPrompt:
-            def get_string(
-                self,
-                question,
-                retrieval_result=None,
-                formatted_reference=None,
-                **_,
-            ):
-                reference = (
-                    formatted_reference
-                    if formatted_reference is not None
-                    else retrieval_result
-                )
-                return f"{question}:{reference}"
 
         pipeline.prompt_template = RecompPrompt()
         dataset = FakeDataset(["q0", "q1"])
@@ -277,26 +259,11 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_recomp_generation_overlaps_following_retrieval_chunk(self):
         pipeline = make_pipeline(
-            "eager",
+            "prefill_batch",
             retrieval_delay=0.03,
             prefill_delay=0.01,
             decode_delay=0.06,
         )
-
-        class RecompPrompt:
-            def get_string(
-                self,
-                question,
-                retrieval_result=None,
-                formatted_reference=None,
-                **_,
-            ):
-                reference = (
-                    formatted_reference
-                    if formatted_reference is not None
-                    else retrieval_result
-                )
-                return f"{question}:{reference}"
 
         pipeline.prompt_template = RecompPrompt()
         dataset = FakeDataset(["q0", "q1", "q2", "q3"])
@@ -304,9 +271,7 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         await pipeline.run_stream_recomp(dataset, do_eval=False)
 
         first, second = pipeline.last_recomp_async_trace
-        self.assertLess(
-            second["retrieval_start_s"], first["compression_end_s"]
-        )
+        self.assertLess(second["retrieval_start_s"], first["compression_end_s"])
 
     async def test_recomp_outer_batches_wait_for_full_prefill_admission(self):
         pipeline = make_pipeline(
@@ -322,21 +287,6 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        class RecompPrompt:
-            def get_string(
-                self,
-                question,
-                retrieval_result=None,
-                formatted_reference=None,
-                **_,
-            ):
-                reference = (
-                    formatted_reference
-                    if formatted_reference is not None
-                    else retrieval_result
-                )
-                return f"{question}:{reference}"
-
         pipeline.prompt_template = RecompPrompt()
         pipeline.reset_cross_microbatch_scheduler()
 
@@ -349,9 +299,7 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         generations = sorted(pipeline.generator.calls, key=lambda call: call["start"])
         self.assertEqual(len(retrievals), 2)
         self.assertEqual(len(pipeline._cross_microbatch_trace), 2)
-        self.assertGreaterEqual(
-            retrievals[1]["start"], generations[0]["prefill_start"]
-        )
+        self.assertGreaterEqual(retrievals[1]["start"], generations[0]["prefill_start"])
         self.assertLess(retrievals[1]["start"], generations[0]["end"])
 
     async def test_irg_outer_batches_wait_for_full_prefill_admission(self):
@@ -380,13 +328,11 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         generations = sorted(pipeline.generator.calls, key=lambda call: call["start"])
         self.assertEqual(len(retrievals), 2)
         self.assertEqual(len(pipeline._cross_microbatch_trace), 2)
-        self.assertGreaterEqual(
-            retrievals[1]["start"], generations[0]["prefill_start"]
-        )
+        self.assertGreaterEqual(retrievals[1]["start"], generations[0]["prefill_start"])
         self.assertLess(retrievals[1]["start"], generations[0]["end"])
 
     async def test_irg_records_final_per_request_completion(self):
-        pipeline = make_pipeline("stage_aware")
+        pipeline = make_pipeline("prefill_batch")
         pipeline.config.update({"irg_max_iter": 1, "irg_min_iter": 1})
         dataset = FakeDataset(["q0", "q1"])
 
@@ -406,58 +352,9 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    async def test_stage_aware_retrieval_runs_inside_decode_window(self):
-        pipeline = make_pipeline("stage_aware")
-        dataset = FakeDataset([f"q{index}" for index in range(6)])
-
-        async def wait_for_following_retrieval(call_index):
-            if call_index >= 2:
-                return
-
-            async def retrieval_finished():
-                while (
-                    len(pipeline.retriever.calls) <= call_index + 1
-                    or "end" not in pipeline.retriever.calls[call_index + 1]
-                ):
-                    await asyncio.sleep(0.001)
-
-            await asyncio.wait_for(retrieval_finished(), timeout=1.0)
-
-        # Keep decode open until the following retrieval completes. This makes
-        # the policy test independent of unrelated GC or host scheduling pauses.
-        pipeline.generator.decode_barrier = wait_for_following_retrieval
-
-        result = await pipeline.run_stream(dataset, do_eval=False)
-        trace = pipeline.last_async_scheduler_trace
-
-        self.assertEqual(len(trace), 3)
-        self.assertEqual(
-            [record["decode_ready_s"] for record in trace],
-            [call["first_token"] for call in pipeline.generator.calls],
-        )
-        self.assertGreater(
-            pipeline.last_async_scheduler_stats["mean_retrieval_decode_coverage"],
-            0.9,
-        )
-        self.assertGreaterEqual(
-            pipeline.last_async_scheduler_stats["mean_post_retrieval_preparation_s"],
-            0.0,
-        )
-        self.assertGreaterEqual(
-            pipeline.last_async_scheduler_stats["mean_decode_observer_delay_s"],
-            0.0,
-        )
-        for current, following in zip(trace, trace[1:]):
-            self.assertGreaterEqual(
-                following["retrieval_start_s"], current["decode_ready_s"]
-            )
-            self.assertLess(following["retrieval_start_s"], current["generation_end_s"])
-        self.assertEqual(result.output["retrieval_score"][0], [0.9, 0.2])
-        self.assertTrue(all(result.output["pred"]))
-
-    async def test_prefill_start_covers_prefill_and_decode_window(self):
+    async def test_prefill_batch_covers_prefill_and_decode_window(self):
         pipeline = make_pipeline(
-            "prefill_start",
+            "prefill_batch",
             retrieval_delay=0.04,
             prefill_delay=0.05,
             decode_delay=0.03,
@@ -493,150 +390,17 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
             0.0,
         )
 
-    async def test_cache_aware_prefill_batching_separates_seed_and_ready_requests(self):
-        pipeline = make_pipeline(
-            "prefill_start",
-            retrieval_delay=0.001,
-            prefill_delay=0.001,
-            decode_delay=0.001,
-        )
-        pipeline.config.update({"cache_aware_prefill_batching": True})
-        pipeline.enable_document_kv_heat = True
-        dataset = FakeDataset(["q0", "q1", "q2", "q3"])
-
-        result = await pipeline.run_stream(dataset, do_eval=False)
-
-        self.assertEqual(
-            [len(call["prompts"]) for call in pipeline.generator.calls],
-            [1, 1, 2],
-        )
-        stats = pipeline._cache_aware_prefill_batching_stats
-        self.assertEqual(stats["admission_batches"], 2)
-        self.assertEqual(stats["cold_requests"], 1)
-        self.assertEqual(stats["ready_requests"], 3)
-        self.assertEqual(stats["cold_batches"], 1)
-        self.assertEqual(stats["ready_batches"], 2)
-        self.assertFalse(stats["completion_barrier"])
-        self.assertEqual(stats["submission_policy"], "cold_then_ready_nonblocking")
-        self.assertLess(
-            pipeline.generator.calls[1]["start"],
-            pipeline.generator.calls[0]["end"],
-        )
-        self.assertEqual(
-            result.output["pred"],
-            [
-                "answer:q0:hot,cold",
-                "answer:q1:hot,cold",
-                "answer:q2:hot,cold",
-                "answer:q3:hot,cold",
-            ],
-        )
-
-    async def test_cache_aware_state_transition_is_atomic_across_workers(self):
-        pipeline = make_pipeline(
-            "eager",
-            retrieval_delay=0.005,
-            prefill_delay=0.005,
-            decode_delay=0.005,
-        )
-        pipeline.config.update(
-            {
-                "cache_aware_prefill_batching": True,
-                "direct_vllm_dispatch": True,
-            }
-        )
-        pipeline.enable_document_kv_heat = True
-        first = FakeDataset(["q0"])
-        second = FakeDataset(["q1"])
-
-        await asyncio.gather(
-            pipeline.run_stream(first, do_eval=False),
-            pipeline.run_stream(second, do_eval=False),
-        )
-
-        kinds = {
-            first._async_scheduler_trace[0]["cache_aware_batch_kind"],
-            second._async_scheduler_trace[0]["cache_aware_batch_kind"],
-        }
-        self.assertEqual(kinds, {"cold", "ready"})
-        stats = pipeline._cache_aware_prefill_batching_stats
-        self.assertEqual(stats["admission_batches"], 2)
-        self.assertEqual(stats["cold_requests"], 1)
-        self.assertEqual(stats["ready_requests"], 1)
-
-    async def test_stage_aware_cannot_contain_retrieval_longer_than_decode(self):
-        pipeline = make_pipeline(
-            "stage_aware",
-            retrieval_delay=0.08,
-            prefill_delay=0.02,
-            decode_delay=0.03,
-        )
-        dataset = FakeDataset([f"q{index}" for index in range(6)])
-
-        await pipeline.run_stream(dataset, do_eval=False)
-        stats = pipeline.last_async_scheduler_stats
-
-        self.assertEqual(stats["transition_pairs"], 2)
-        self.assertEqual(stats["decode_contained_pairs"], 0)
-        self.assertGreater(stats["mean_retrieval_decode_coverage"], 0.0)
-        self.assertLess(stats["mean_retrieval_decode_coverage"], 1.0)
-
-    async def test_eager_uses_prefill_but_can_finish_before_generation(self):
-        pipeline = make_pipeline(
-            "eager",
-            retrieval_delay=0.05,
-            prefill_delay=0.03,
-            decode_delay=0.04,
-        )
-        dataset = FakeDataset([f"q{index}" for index in range(6)])
-
-        await pipeline.run_stream(dataset, do_eval=False)
-        stats = pipeline.last_async_scheduler_stats
-
-        self.assertEqual(stats["decode_contained_pairs"], 0)
-        self.assertEqual(stats["generation_contained_pairs"], 2)
-        self.assertGreater(stats["mean_retrieval_prefill_coverage"], 0.0)
-
-    async def test_adaptive_policy_uses_bounded_prefill_lead(self):
-        pipeline = make_pipeline(
-            "adaptive",
-            retrieval_delay=0.10,
-            prefill_delay=0.06,
-            decode_delay=0.04,
-        )
-        dataset = FakeDataset([f"q{index}" for index in range(6)])
-
-        await pipeline.run_stream(dataset, do_eval=False)
-        first, second, third = pipeline.last_async_scheduler_trace
-
-        self.assertEqual(first["adaptive_gate"], "stage_aware_warmup")
-        self.assertEqual(second["adaptive_gate"], "predictive")
-        self.assertGreater(third["retrieval_start_s"], second["generation_start_s"])
-        self.assertLess(
-            second["adaptive_retrieval_target_s"],
-            second["decode_ready_s"],
-        )
-        self.assertLess(third["retrieval_start_s"], second["generation_end_s"])
-        self.assertGreater(second["adaptive_prefill_lead_s"], 0.0)
-        self.assertLessEqual(
-            second["adaptive_prefill_lead_s"],
-            second["adaptive_prefill_ema_s"] * 0.5 + 1e-6,
-        )
-        stats = pipeline.last_async_scheduler_stats
-        self.assertGreater(stats["mean_retrieval_decode_coverage"], 0.0)
-        self.assertEqual(stats["transition_pairs"], 2)
-
-    async def test_stage_gate_timeout_cancels_generation_worker(self):
-        pipeline = make_pipeline("stage_aware")
+    async def test_prefill_gate_timeout_cancels_generation_worker(self):
+        pipeline = make_pipeline("prefill_batch")
         pipeline.config["async_scheduler_gate_timeout_s"] = 0.02
         pipeline.generator = HangingGenerator()
         dataset = FakeDataset(["q0", "q1", "q2", "q3"])
 
-        with self.assertRaisesRegex(TimeoutError, "first token"):
+        with self.assertRaisesRegex(TimeoutError, "full-batch prefill admission"):
             await pipeline.run_stream(dataset, do_eval=False)
 
-    async def test_eager_propagates_generation_failure_without_deadlock(self):
-        pipeline = make_pipeline("eager", retrieval_delay=0.002)
+    async def test_prefill_batch_propagates_generation_failure_without_deadlock(self):
+        pipeline = make_pipeline("prefill_batch", retrieval_delay=0.002)
         pipeline.config["async_generation_queue_batches"] = 1
         pipeline.config["async_scheduler_gate_timeout_s"] = 0.2
         pipeline.generator = FailingGenerator()
@@ -648,7 +412,7 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
             )
 
     async def test_generator_output_count_must_match_prompt_count(self):
-        pipeline = make_pipeline("stage_aware")
+        pipeline = make_pipeline("prefill_batch")
         pipeline.generator = ShortGenerator()
         dataset = FakeDataset(["q0", "q1"])
 
@@ -659,7 +423,7 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         pipeline = make_pipeline(
-            "stage_aware",
+            "prefill_batch",
             retrieval_delay=0.02,
             prefill_delay=0.03,
             decode_delay=0.08,
@@ -679,51 +443,14 @@ class AsyncSchedulerTest(unittest.IsolatedAsyncioTestCase):
         generations = sorted(pipeline.generator.calls, key=lambda call: call["start"])
         self.assertEqual(len(retrievals), 2)
         self.assertEqual(len(generations), 2)
-        self.assertGreaterEqual(retrievals[1]["start"], generations[0]["first_token"])
+        self.assertGreaterEqual(retrievals[1]["start"], generations[0]["prefill_start"])
         self.assertLess(retrievals[1]["start"], generations[0]["end"])
         self.assertLess(generations[1]["start"], generations[0]["end"])
         cross_stats = pipeline.summarize_scheduler_trace(
-            pipeline._cross_microbatch_trace, "stage_aware"
+            pipeline._cross_microbatch_trace, "prefill_batch"
         )
         self.assertEqual(cross_stats["transition_pairs"], 1)
-        self.assertEqual(cross_stats["decode_contained_pairs"], 1)
-
-    async def test_adaptive_state_persists_across_workflow_microbatches(self):
-        pipeline = make_pipeline(
-            "adaptive",
-            retrieval_delay=0.10,
-            prefill_delay=0.06,
-            decode_delay=0.04,
-        )
-        pipeline.config["retrieval_batch_size"] = 8
-        pipeline.config["async_cross_microbatch_pipeline"] = True
-        pipeline.reset_cross_microbatch_scheduler()
-        batches = [FakeDataset([f"q{index}"]) for index in range(3)]
-
-        await asyncio.gather(
-            *(pipeline.run_stream(batch, do_eval=False) for batch in batches)
-        )
-
-        first, second, third = pipeline._cross_microbatch_trace
-        self.assertEqual(first["adaptive_gate"], "stage_aware_warmup")
-        self.assertEqual(second["adaptive_gate"], "predictive")
-        self.assertGreater(third["retrieval_start_s"], second["generation_start_s"])
-        self.assertLess(third["retrieval_start_s"], second["decode_ready_s"])
-        self.assertTrue(
-            all(
-                value is not None
-                for value in pipeline._cross_microbatch_adaptive_state.values()
-            )
-        )
-
-        pipeline.reset_cross_microbatch_scheduler()
-        self.assertEqual(pipeline._cross_microbatch_trace, [])
-        self.assertTrue(
-            all(
-                value is None
-                for value in pipeline._cross_microbatch_adaptive_state.values()
-            )
-        )
+        self.assertEqual(cross_stats["generation_contained_pairs"], 1)
 
 
 if __name__ == "__main__":

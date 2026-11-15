@@ -121,47 +121,32 @@ async def poisson_persistent_workflow_run(
             raise ValueError(
                 "arrival_offsets must contain exactly one value per request"
             )
-        if np.any(scheduled_arrivals < 0) or np.any(
-            np.diff(scheduled_arrivals) < 0
-        ):
+        if np.any(scheduled_arrivals < 0) or np.any(np.diff(scheduled_arrivals) < 0):
             raise ValueError("arrival_offsets must be nonnegative and monotonic")
         arrival_trace_source = "provided"
         arrival_trace_normalized = False
 
     worker_count = max(1, int(worker_count))
     microbatch_max_size = max(1, int(microbatch_max_size))
-    try:
-        direct_vllm_dispatch = bool(
-            pipeline.config["direct_vllm_dispatch"]
-        )
-    except Exception:
-        direct_vllm_dispatch = False
     reset_retrieval = getattr(pipeline, "reset_retrieval_batcher_stats", None)
     if callable(reset_retrieval):
         reset_retrieval()
 
     try:
-        cross_requested = bool(
-            pipeline.config["async_cross_microbatch_pipeline"]
-        )
+        cross_requested = bool(pipeline.config["async_cross_microbatch_pipeline"])
     except Exception:
         cross_requested = False
     try:
-        retrieval_batch_size = max(
-            1, int(pipeline.config["retrieval_batch_size"])
-        )
+        retrieval_batch_size = max(1, int(pipeline.config["retrieval_batch_size"]))
     except Exception:
         retrieval_batch_size = microbatch_max_size
     cross_enabled = bool(
         cross_requested
-        and not direct_vllm_dispatch
         and worker_count >= 2
         and microbatch_max_size <= retrieval_batch_size
     )
     if cross_enabled:
-        reset_cross = getattr(
-            pipeline, "reset_cross_microbatch_scheduler", None
-        )
+        reset_cross = getattr(pipeline, "reset_cross_microbatch_scheduler", None)
         if callable(reset_cross):
             reset_cross()
 
@@ -196,8 +181,8 @@ async def poisson_persistent_workflow_run(
         "requested_worker_count": worker_count,
         "effective_worker_count": worker_count,
         "workflow_concurrency_policy": "explicit_worker_count",
-        "direct_vllm_dispatch": direct_vllm_dispatch,
-        "application_generation_gate": not direct_vllm_dispatch,
+        "direct_vllm_dispatch": False,
+        "application_generation_gate": True,
         "retrieval_coalescing_policy": "ready_only_no_timed_window",
         "retrieval_intentional_wait_ms": 0.0,
         "generation_admission_policy": (
@@ -208,8 +193,6 @@ async def poisson_persistent_workflow_run(
         "cross_microbatch_disabled_reason": (
             None
             if cross_enabled or not cross_requested
-            else "superseded_by_direct_vllm_dispatch"
-            if direct_vllm_dispatch
             else "worker_count_or_batch_shape"
         ),
         "exact_request_completion_timestamps": 0,
@@ -321,13 +304,9 @@ async def poisson_persistent_workflow_run(
             "run_pipeline_time_s": elapsed,
             "throughput_qps": total_n / elapsed if elapsed else 0.0,
             "realized_arrival_rate_rps": (
-                total_n / actual_arrivals[-1]
-                if actual_arrivals[-1] > 0
-                else 0.0
+                total_n / actual_arrivals[-1] if actual_arrivals[-1] > 0 else 0.0
             ),
-            "arrival_schedule_lag_mean_s": float(
-                np.mean(arrival_schedule_lag)
-            ),
+            "arrival_schedule_lag_mean_s": float(np.mean(arrival_schedule_lag)),
             "arrival_schedule_lag_max_s": float(np.max(arrival_schedule_lag)),
             "e2e_latency_origin": "scheduled_arrival",
             "avg_e2e_s": float(np.mean(latency_values)),
@@ -336,9 +315,7 @@ async def poisson_persistent_workflow_run(
             "p99_e2e_s": float(np.percentile(latency_values, 99)),
             "max_e2e_s": float(np.max(latency_values)),
             "post_admission_latency_mean_s": float(np.mean(post_admission)),
-            "post_admission_latency_p95_s": float(
-                np.percentile(post_admission, 95)
-            ),
+            "post_admission_latency_p95_s": float(np.percentile(post_admission, 95)),
             "unique_finish_offsets": len(set(finish_offsets)),
             "completion_timestamp_mode": (
                 "per_request_generation"
@@ -349,9 +326,7 @@ async def poisson_persistent_workflow_run(
     )
     if callable(admission_stats_getter):
         stats["generation_admission"] = admission_stats_getter()
-    retrieval_stats_getter = getattr(
-        pipeline, "get_retrieval_batcher_stats", None
-    )
+    retrieval_stats_getter = getattr(pipeline, "get_retrieval_batcher_stats", None)
     if callable(retrieval_stats_getter):
         stats["retrieval_batcher"] = retrieval_stats_getter()
     if batch_stage_runs:
@@ -383,7 +358,6 @@ async def poisson_persistent_workflow_run(
         cross_stats = summarize(
             cross_trace,
             policy,
-            getattr(pipeline, "_cross_microbatch_adaptive_state", None),
         )
         cross_stats["workflow_batches"] = len(cross_trace)
         cross_stats["cross_microbatch_pipeline"] = True
@@ -397,18 +371,20 @@ async def poisson_persistent_workflow_run(
         pipeline.last_async_scheduler_stats = cross_stats
     elif batch_stage_runs:
         transition_pairs = sum(
-            run["stats"].get("transition_pairs", 0)
-            for run in batch_stage_runs
+            run["stats"].get("transition_pairs", 0) for run in batch_stage_runs
         )
 
         def weighted_mean(name):
             if not transition_pairs:
                 return 0.0
-            return sum(
-                run["stats"].get(name, 0.0)
-                * run["stats"].get("transition_pairs", 0)
-                for run in batch_stage_runs
-            ) / transition_pairs
+            return (
+                sum(
+                    run["stats"].get(name, 0.0)
+                    * run["stats"].get("transition_pairs", 0)
+                    for run in batch_stage_runs
+                )
+                / transition_pairs
+            )
 
         flattened = []
         for run in batch_stage_runs:
@@ -420,13 +396,10 @@ async def poisson_persistent_workflow_run(
         pipeline.last_async_scheduler_stats = {
             "policy": latest.get("policy"),
             "workflow_batches": len(batch_stage_runs),
-            "batches": sum(
-                run["stats"].get("batches", 0) for run in batch_stage_runs
-            ),
+            "batches": sum(run["stats"].get("batches", 0) for run in batch_stage_runs),
             "transition_pairs": transition_pairs,
             "decode_overlap_pairs": sum(
-                run["stats"].get("decode_overlap_pairs", 0)
-                for run in batch_stage_runs
+                run["stats"].get("decode_overlap_pairs", 0) for run in batch_stage_runs
             ),
             "decode_contained_pairs": sum(
                 run["stats"].get("decode_contained_pairs", 0)
@@ -449,8 +422,8 @@ async def poisson_persistent_workflow_run(
             "effective_async_retrieval_policy": latest.get(
                 "effective_async_retrieval_policy"
             ),
-            "direct_vllm_dispatch": direct_vllm_dispatch,
-            "application_generation_gate": not direct_vllm_dispatch,
+            "direct_vllm_dispatch": False,
+            "application_generation_gate": True,
             "generation_queue_capacity_batches": stats.get(
                 "generation_queue_capacity_batches"
             ),
@@ -469,17 +442,11 @@ async def poisson_persistent_workflow_run(
                         scheduled_arrivals[request_idx]
                     ),
                     "arrival_offset_s": float(scheduled_arrivals[request_idx]),
-                    "actual_arrival_offset_s": float(
-                        actual_arrivals[request_idx]
-                    ),
-                    "arrival_schedule_lag_s": float(
-                        arrival_schedule_lag[request_idx]
-                    ),
+                    "actual_arrival_offset_s": float(actual_arrivals[request_idx]),
+                    "arrival_schedule_lag_s": float(arrival_schedule_lag[request_idx]),
                     "finish_offset_s": float(finish_offsets[request_idx]),
                     "e2e_latency_s": float(latency_values[request_idx]),
-                    "post_admission_latency_s": float(
-                        post_admission[request_idx]
-                    ),
+                    "post_admission_latency_s": float(post_admission[request_idx]),
                 }
             )
             if dispatch is not None:

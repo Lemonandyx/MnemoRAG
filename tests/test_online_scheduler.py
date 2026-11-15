@@ -13,7 +13,6 @@ class FakeGenerator:
 class FakePipeline:
     def __init__(self):
         self.config = {
-            "direct_vllm_dispatch": True,
             "async_cross_microbatch_pipeline": False,
             "retrieval_batch_size": 2,
         }
@@ -43,7 +42,7 @@ class FakePipeline:
             [now for _ in dataset.question],
         )
         dataset._async_scheduler_stats = {
-            "policy": "eager",
+            "policy": "prefill_batch",
             "batches": 1,
             "transition_pairs": 0,
         }

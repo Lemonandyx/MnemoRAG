@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         "--stop-after-slo-violation",
         action="store_true",
         help=(
-            "For candidate QPS scans, retain each system's first p99 > SLO "
+            "For candidate QPS scans, retain each system's first mean latency > SLO "
             "point and skip that system at higher QPS values."
         ),
     )
@@ -503,17 +503,6 @@ def build_system_command(
         output_dir,
     )
     if system == "mnemorag":
-        workflow_specific = (
-            [
-                "--cache-aware-prefill-batching",
-                "--no-cross-microbatch-pipeline",
-            ]
-            if group.workflow == "onepass"
-            else [
-                "--no-cache-aware-prefill-batching",
-                "--cross-microbatch-pipeline",
-            ]
-        )
         command = (
             prefix
             + [str(HERE / "benchmark_point.py")]
@@ -531,7 +520,7 @@ def build_system_command(
                 "8",
                 "--async-retrieval-policy",
                 "prefill_batch",
-                "--no-direct-vllm-dispatch",
+                "--cross-microbatch-pipeline",
                 "--async-generation-queue-batches",
                 "2",
                 "--max-num-batched-tokens",
@@ -545,7 +534,6 @@ def build_system_command(
                 "--record-prefix-distribution",
                 "--record-stage-breakdown",
             ]
-            + workflow_specific
             + mnemo_extra_args
         )
         return command, PROJECT_ROOT
@@ -756,8 +744,7 @@ def run_group(
             "systems_measured": [summary["system"] for summary in summaries],
             "systems_skipped": sorted(skipped),
             "standalone_validations": [
-                validate_standalone_point(summary)
-                for summary in summaries
+                validate_standalone_point(summary) for summary in summaries
             ],
         }
     atomic_write_json(
@@ -823,8 +810,8 @@ def main() -> None:
 
     def candidate_censoring_payload(*, complete: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "policy": "per-system stop after first p99 > latency SLO",
-            "latency_slo_seconds": 10.0,
+            "policy": "per-system stop after first mean latency > SLO",
+            "latency_slo_seconds": args.latency_slo_seconds,
             "qps_cap_by_workflow": {
                 workflow: max(map(float, grid)) for workflow, grid in QPS_GRIDS.items()
             },
@@ -865,7 +852,7 @@ def main() -> None:
                     "group": group.identifier(),
                     "qps": group.qps,
                     "systems_skipped": sorted(skipped_systems),
-                    "reason": "all systems previously crossed p99 latency SLO",
+                    "reason": "all systems previously crossed mean latency SLO",
                 }
             )
             atomic_write_json(
@@ -931,14 +918,14 @@ def main() -> None:
         all_summaries.extend(group_summaries)
         if args.phase == "candidate" and args.stop_after_slo_violation:
             for summary in group_summaries:
-                p99 = float(summary["request_latency_p99_s"])
-                if p99 > float(group.latency_slo_seconds):
+                mean_latency = float(summary["request_latency_mean_s"])
+                if mean_latency > float(group.latency_slo_seconds):
                     crossed_slo.setdefault(scan_key, {}).setdefault(
                         summary["system"],
                         {
                             "group": group.identifier(),
                             "qps": group.qps,
-                            "p99_latency_s": p99,
+                            "mean_latency_s": mean_latency,
                             "latency_slo_seconds": group.latency_slo_seconds,
                         },
                     )

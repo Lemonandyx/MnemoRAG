@@ -46,7 +46,6 @@ def make_prompt_template():
     template.reference_template = None
     template.is_chat = True
     template.enable_chat = True
-    template.is_openai = False
     template.tokenizer = CharacterTokenizer()
     return template
 
@@ -87,9 +86,7 @@ def test_prompt_reports_final_document_span_when_chat_template_trims_newline():
 
     assert len(spans) == 1
     span = spans[0]
-    assert prompt[span["char_start"] : span["char_end"]] == (
-        "Doc1: Alpha first fact"
-    )
+    assert prompt[span["char_start"] : span["char_end"]] == ("Doc1: Alpha first fact")
 
 
 def test_prompt_uses_the_paper_ordering_hint_exactly():
@@ -112,6 +109,17 @@ def test_prompt_uses_the_paper_ordering_hint_exactly():
         "Doc2>Doc3>Doc1 to answer the question."
     ) in prompt
     assert "relevance=" not in prompt
+
+
+def test_prompt_preserves_literal_placeholders_inside_documents_and_drafts():
+    template = make_prompt_template()
+    prompt = template.get_string(
+        question="Which?",
+        retrieval_result=[{"id": 7, "contents": "Title\nLiteral {question}"}],
+        previous_gen='Draft {"answer": "{reference}"}',
+    )
+    assert "Literal {question}" in prompt
+    assert 'Draft {"answer": "{reference}"}' in prompt
 
 
 def test_pipeline_uses_retrieval_index_for_document_heat():

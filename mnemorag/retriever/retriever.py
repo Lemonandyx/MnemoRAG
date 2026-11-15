@@ -22,7 +22,6 @@ import uuid
 from collections import defaultdict
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import functools
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
@@ -35,31 +34,20 @@ from mnemorag.pipeline.utils import QueryPool, QueryState
 from mnemorag.retriever.encoder import Encoder
 from mnemorag.retriever.utils import (
     adaptive_probe_budget,
-    convert_numpy,
     load_corpus,
     load_docs,
 )
-from mnemorag.utils import get_device, get_reranker
+from mnemorag.utils import get_device
 
 MNEMORAG_T_REUSE = 0.95
 MNEMORAG_T_GUIDED = 0.85
-_THRESHOLD_OVERRIDE_ENV = "MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"
 
 
 def _resolve_similarity_thresholds(config):
-    t_reuse = MNEMORAG_T_REUSE
-    t_guided = MNEMORAG_T_GUIDED
-    if os.environ.get(_THRESHOLD_OVERRIDE_ENV) == "1":
-        config_t_reuse = config["similarity_t_reuse"]
-        config_t_guided = config["similarity_t_guided"]
-        t_reuse = float(
-            os.environ.get("MNEMORAG_T_REUSE") or config_t_reuse or MNEMORAG_T_REUSE
-        )
-        t_guided = float(
-            os.environ.get("MNEMORAG_T_GUIDED") or config_t_guided or MNEMORAG_T_GUIDED
-        )
-    if t_guided > t_reuse:
-        raise ValueError(f"T_GUIDED ({t_guided}) must be <= T_REUSE ({t_reuse})")
+    t_reuse = float(config["similarity_t_reuse"] or MNEMORAG_T_REUSE)
+    t_guided = float(config["similarity_t_guided"] or MNEMORAG_T_GUIDED)
+    if not 0 <= t_guided <= t_reuse <= 1:
+        raise ValueError("Thresholds must satisfy 0 <= guided <= reuse <= 1")
     return t_reuse, t_guided
 
 
@@ -93,221 +81,6 @@ if get_device() == "cpu":
     faiss.omp_set_num_threads(faiss_omp_threads)
 
 
-def cache_manager(func):
-    """
-    Decorator used for retrieving document cache.
-    With the decorator, The retriever can store each retrieved document as a file and reuse it.
-    """
-
-    @functools.wraps(func)
-    def wrapper(
-        self,
-        query=None,
-        num=None,
-        query_pool=None,
-        return_score=False,
-        return_idx=False,
-    ):
-        if num is None:
-            num = self.topk
-        single_query = isinstance(query, str)
-        if self.use_cache:
-            if single_query:
-                new_query_list = [query]
-            else:
-                new_query_list = query
-
-            no_cache_query = []
-            cache_results = []
-            for new_query in new_query_list:
-                if new_query in self.cache:
-                    cache_res = self.cache[new_query]
-                    if len(cache_res) < num:
-                        warnings.warn(
-                            f"The number of cached retrieval results is less than topk ({num})"
-                        )
-                    cache_res = cache_res[:num]
-                    docs, doc_scores, doc_idxs = [], [], []
-                    for cached_item in cache_res:
-                        item = dict(cached_item)
-                        if "_retrieval_score" in item:
-                            score = item.pop("_retrieval_score")
-                        else:
-                            score = item.pop("score", None)
-                        doc_idx = item.pop("_retrieval_idx", None)
-                        if doc_idx is None:
-                            corpus_id = item.get("id")
-                            if str(corpus_id).lstrip("-").isdigit():
-                                doc_idx = int(corpus_id)
-                        if score is None:
-                            raise ValueError(
-                                "Cached retrieval entry has no score; regenerate "
-                                "the retrieval cache"
-                            )
-                        if doc_idx is None and return_idx:
-                            raise ValueError(
-                                "Cached retrieval entry has no Faiss document index; "
-                                "regenerate the cache with the current format"
-                            )
-                        docs.append(item)
-                        doc_scores.append(score)
-                        doc_idxs.append(doc_idx)
-                    cache_results.append((docs, doc_scores, doc_idxs))
-                else:
-                    cache_results.append(None)
-                    no_cache_query.append(new_query)
-
-            if no_cache_query != []:
-                # use batch search without decorator
-                (
-                    no_cache_results,
-                    no_cache_scores,
-                    no_cache_idxs,
-                ) = self._batch_search_with_rerank(
-                    query=no_cache_query,
-                    num=num,
-                    query_pool=query_pool,
-                    return_score=True,
-                    return_idx=True,
-                )
-                no_cache_idx = 0
-                for idx, res in enumerate(cache_results):
-                    if res is None:
-                        assert new_query_list[idx] == no_cache_query[no_cache_idx]
-                        cache_results[idx] = (
-                            no_cache_results[no_cache_idx],
-                            no_cache_scores[no_cache_idx],
-                            no_cache_idxs[no_cache_idx],
-                        )
-                        no_cache_idx += 1
-
-            results, scores, idxs = (
-                [t[0] for t in cache_results],
-                [t[1] for t in cache_results],
-                [t[2] for t in cache_results],
-            )
-
-        else:
-            results, scores, idxs = func(
-                self,
-                query=query,
-                query_pool=query_pool,
-                num=num,
-                return_score=True,
-                return_idx=True,
-            )
-        if self.save_cache:
-            save_queries = [query] if single_query else query
-            save_results, save_scores, save_idxs = results, scores, idxs
-            if single_query and "batch" not in func.__name__ and not self.use_cache:
-                save_results = [save_results]
-                save_scores = [save_scores]
-                save_idxs = [save_idxs]
-            for new_query, doc_items, doc_scores, doc_idxs in zip(
-                save_queries, save_results, save_scores, save_idxs
-            ):
-                cached_items = []
-                for item, score, doc_idx in zip(doc_items, doc_scores, doc_idxs):
-                    cached_item = dict(item)
-                    cached_item["_retrieval_score"] = score
-                    cached_item["_retrieval_idx"] = int(doc_idx)
-                    cached_items.append(cached_item)
-                self.cache[new_query] = cached_items
-
-        if self.use_cache and single_query and "batch" not in func.__name__:
-            results, scores, idxs = results[0], scores[0], idxs[0]
-
-        if return_idx:
-            return results, scores, idxs
-        if return_score:
-            return results, scores
-        else:
-            return results
-
-    return wrapper
-
-
-def rerank_manager(func):
-    """
-    Decorator used for reranking retrieved documents.
-    """
-
-    @functools.wraps(func)
-    def wrapper(
-        self, query, num=None, query_pool=None, return_score=False, return_idx=False
-    ):
-        results, scores, idxs = func(
-            self,
-            query=query,
-            num=num,
-            query_pool=query_pool,
-            return_score=True,
-            return_idx=True,
-        )
-        if self.use_reranker:
-            original_results = results
-            original_idxs = idxs
-            results, scores = self.reranker.rerank(query, results)
-            if "batch" not in func.__name__:
-                results = results[0]
-                scores = scores[0]
-                original_results = [original_results]
-                original_idxs = [original_idxs]
-                reranked_batches = [results]
-            else:
-                reranked_batches = results
-
-            aligned_idxs = []
-            for source_docs, source_idxs, reranked_docs in zip(
-                original_results, original_idxs, reranked_batches
-            ):
-                remaining = list(range(len(source_docs)))
-                reordered = []
-                for reranked_doc in reranked_docs:
-                    match = next(
-                        (pos for pos in remaining if source_docs[pos] is reranked_doc),
-                        None,
-                    )
-                    if match is None and isinstance(reranked_doc, dict):
-                        reranked_id = reranked_doc.get("id")
-                        if reranked_id is not None:
-                            match = next(
-                                (
-                                    pos
-                                    for pos in remaining
-                                    if isinstance(source_docs[pos], dict)
-                                    and source_docs[pos].get("id") == reranked_id
-                                ),
-                                None,
-                            )
-                    if match is None:
-                        match = next(
-                            (
-                                pos
-                                for pos in remaining
-                                if source_docs[pos] == reranked_doc
-                            ),
-                            None,
-                        )
-                    if match is None:
-                        raise ValueError(
-                            "Reranker returned a document that is absent from "
-                            "the retrieval candidates"
-                        )
-                    reordered.append(source_idxs[match])
-                    remaining.remove(match)
-                aligned_idxs.append(reordered)
-            idxs = aligned_idxs if "batch" in func.__name__ else aligned_idxs[0]
-        if return_idx:
-            return results, scores, idxs
-        if return_score:
-            return results, scores
-        else:
-            return results
-
-    return wrapper
-
-
 class BaseRetriever:
     """Base object for all retrievers."""
 
@@ -335,25 +108,6 @@ class BaseRetriever:
         self.index_path = self._config["index_path"]
         self.corpus_path = self._config["corpus_path"]
 
-        self.save_cache = self._config["save_retrieval_cache"]
-        self.use_cache = self._config["use_retrieval_cache"]
-        self.cache_path = self._config["retrieval_cache_path"]
-
-        self.use_reranker = self._config["use_reranker"]
-        if self.use_reranker:
-            self.reranker = get_reranker(self._config)
-        else:
-            self.reranker = None
-
-        if self.save_cache:
-            self.cache_save_path = os.path.join(
-                self._config["save_dir"], "retrieval_cache.json"
-            )
-            self.cache = {}
-        if self.use_cache:
-            assert self.cache_path is not None
-            with open(self.cache_path, "r") as f:
-                self.cache = json.load(f)
         self.silent = (
             self._config["silent_retrieval"]
             if "silent_retrieval" in self._config
@@ -362,17 +116,6 @@ class BaseRetriever:
 
     def update_additional_setting(self):
         raise NotImplementedError
-
-    def _save_cache(self):
-        self.cache = convert_numpy(self.cache)
-
-        def custom_serializer(obj):
-            if isinstance(obj, np.float32):
-                return float(obj)
-            raise TypeError(f"Type {type(obj)} not serializable")
-
-        with open(self.cache_save_path, "w") as f:
-            json.dump(self.cache, f, indent=4, default=custom_serializer)
 
     def _search(self, query: str, num: int, return_score: bool) -> List[Dict[str, str]]:
         r"""Retrieve topk relevant documents in corpus.
@@ -397,40 +140,7 @@ class BaseRetriever:
         return self._batch_search(*args, **kwargs)
 
 
-class BaseTextRetriever(BaseRetriever):
-    """Base text retriever."""
-
-    def __init__(self, config):
-        super().__init__(config)
-
-    @cache_manager
-    @rerank_manager
-    def search(self, *args, **kwargs):
-        return self._search(*args, **kwargs)
-
-    @cache_manager
-    @rerank_manager
-    def batch_search(
-        self, query, num=None, query_pool=None, return_score=False, return_idx=False
-    ):
-        return self._batch_search(
-            query=query,
-            num=num,
-            query_pool=query_pool,
-            return_score=return_score,
-            return_idx=return_idx,
-        )
-
-    @rerank_manager
-    def _batch_search_with_rerank(self, *args, **kwargs):
-        return self._batch_search(*args, **kwargs)
-
-    @rerank_manager
-    def _search_with_rerank(self, *args, **kwargs):
-        return self._search(*args, **kwargs)
-
-
-class DenseRetriever(BaseTextRetriever):
+class DenseRetriever(BaseRetriever):
     r"""Dense retriever based on pre-built faiss index."""
 
     def __init__(self, config: dict, corpus=None):
@@ -778,12 +488,6 @@ class DenseRetriever(BaseTextRetriever):
                 ),
                 "requests": int(getattr(self, "_exact_query_fast_path_requests", 0)),
             },
-            "adaptive_reuse_first": {
-                "batches": int(getattr(self, "_reuse_first_batches", 0)),
-                "quantizer_skips": int(
-                    getattr(self, "_reuse_first_quantizer_skips", 0)
-                ),
-            },
             "single_query_probe_parallelism": {
                 "enabled": (self._single_query_probe_partition_limit() > 1),
                 "searches": int(getattr(self, "_single_query_partitioned_searches", 0)),
@@ -1059,66 +763,6 @@ class DenseRetriever(BaseTextRetriever):
             return results, scores
         else:
             return results
-
-    def __batch_search(
-        self,
-        query,
-        num=None,
-        query_pool: QueryPool = None,
-        return_score=False,
-        return_idx=False,
-    ):
-        retrieval_start = time.time()
-        if isinstance(query, str):
-            query = [query]
-
-        if num is None:
-            num = self.topk
-
-        batch_size = self.batch_size
-        results = []
-        scores = []
-        encode_time_st = time.time()
-        emb = self.encoder.encode(query, batch_size=batch_size, is_query=True)
-        encode_time_ed = time.time()
-
-        print(
-            f"Encoding time for {len(query)} samples: {encode_time_ed - encode_time_st:.4f} seconds"
-        )
-
-        search_time_st = time.time()
-        scores, idxs = self.index.search(emb, k=num)
-        search_time_ed = time.time()
-
-        print(
-            f"Faiss search time for {len(query)} samples: {search_time_ed - search_time_st:.4f} seconds"
-        )
-
-        scores = scores.tolist()
-        idxs = idxs.tolist()
-
-        flat_idxs = [idx for sublist in idxs for idx in sublist]
-
-        load_docs_time_st = time.time()
-        results = load_docs(self.corpus, flat_idxs)
-        load_docs_time_ed = time.time()
-
-        print(
-            f"load_docs time: {load_docs_time_ed - load_docs_time_st:.4f} seconds"
-        )
-
-        results = [results[i * num : (i + 1) * num] for i in range(len(idxs))]
-        retrieval_end = time.time()
-        print(
-            f"Retrieval time for {len(query)} samples: {retrieval_end - retrieval_start:.4f}s"
-        )
-        if return_idx:
-            return results, scores, idxs
-
-        if return_score:
-            return results, scores
-
-        return results
 
     # Batched IVF retrieval with one OpenMP thread per worker.
     def _batch_search(
@@ -1402,17 +1046,13 @@ class DenseRetriever(BaseTextRetriever):
         NPROBE_CURVE = str(
             optional_config("similarity_nprobe_curve", "power_decay")
         ).lower()
-        if NPROBE_CURVE not in {"power_decay", "late_decay"}:
-            raise ValueError(
-                "similarity_nprobe_curve must be power_decay or late_decay"
-            )
+        if NPROBE_CURVE != "power_decay":
+            raise ValueError("similarity_nprobe_curve must be power_decay")
         NORMALIZATION = str(
             optional_config("similarity_nprobe_normalization", "cumulative")
         ).lower()
-        if NORMALIZATION not in {"threshold", "cumulative"}:
-            raise ValueError(
-                "similarity_nprobe_normalization must be threshold or cumulative"
-            )
+        if NORMALIZATION != "cumulative":
+            raise ValueError("similarity_nprobe_normalization must be cumulative")
         NPROBE_ROUNDING = str(
             optional_config("similarity_nprobe_rounding", "ceil")
         ).lower()
@@ -1457,9 +1097,7 @@ class DenseRetriever(BaseTextRetriever):
             similarity_emb = emb
         encode_time_ed = time.perf_counter()
         phase_times["encode_s"] = encode_time_ed - encode_time_st
-        debug(
-            f"Encoding time for {B} samples: {phase_times['encode_s']:.4f}s"
-        )
+        debug(f"Encoding time for {B} samples: {phase_times['encode_s']:.4f}s")
 
         # IVF & quantizer
         (
@@ -1515,25 +1153,10 @@ class DenseRetriever(BaseTextRetriever):
             and query_pool is not None
             and query_pool.current_size() > 0
         ):
-            adaptive_reuse_first = os.environ.get(
-                "MNEMORAG_ADAPTIVE_REUSE_FIRST_QUANTIZER", "0"
-            ) == "1" and bool(getattr(self, "_previous_batch_all_reuse", False))
-            if adaptive_reuse_first:
-                self._reuse_first_batches = getattr(self, "_reuse_first_batches", 0) + 1
-                sim_scores, sim_idxs = run_similarity()
-                if bool(torch.all(sim_scores[:, 0] >= T_REUSE)):
-                    self_D_all, self_I_all = None, None
-                    phase_times["quantizer_s"] = 0.0
-                    self._reuse_first_quantizer_skips = (
-                        getattr(self, "_reuse_first_quantizer_skips", 0) + 1
-                    )
-                else:
-                    self_D_all, self_I_all = run_quantizer(list(range(B)))
-            else:
-                f_sim = overlap_executor.submit(run_similarity)
-                f_quant = overlap_executor.submit(run_quantizer, list(range(B)))
-                sim_scores, sim_idxs = f_sim.result()
-                self_D_all, self_I_all = f_quant.result()
+            f_sim = overlap_executor.submit(run_similarity)
+            f_quant = overlap_executor.submit(run_quantizer, list(range(B)))
+            sim_scores, sim_idxs = f_sim.result()
+            self_D_all, self_I_all = f_quant.result()
 
             parallel_ed = time.perf_counter()
             phase_times["similarity_quantizer_wall_s"] = parallel_ed - parallel_st
@@ -1547,9 +1170,7 @@ class DenseRetriever(BaseTextRetriever):
             phase_times["similarity_s"] = 0.0
             phase_times["quantizer_s"] = 0.0
             phase_times["similarity_quantizer_wall_s"] = 0.0
-            debug(
-                "Similarity-Aware Retrieval bypassed: using full IVF search"
-            )
+            debug("Similarity-Aware Retrieval bypassed: using full IVF search")
 
         if sim_scores is not None:
             max_sim = sim_scores[:, 0]
@@ -1878,9 +1499,7 @@ class DenseRetriever(BaseTextRetriever):
         cpu_time_ed = time.perf_counter()
         phase_times["ivf_search_s"] = cpu_time_ed - cpu_time_st
         if batch_full_search:
-            debug(
-                f"FAISS batch-full fast path: {len(faiss_indices)} samples"
-            )
+            debug(f"FAISS batch-full fast path: {len(faiss_indices)} samples")
         debug(f"CPU IVF search time: {phase_times['ivf_search_s']:.4f}s")
 
         # load docs
@@ -1930,10 +1549,7 @@ class DenseRetriever(BaseTextRetriever):
         publish_request_timings(request_completion_s, request_search_service_s, actions)
         phase_times["total_s"] = self.last_retrieval_elapsed
         self._record_retrieval_profile(phase_times, actions, guided_probe_metrics)
-        debug(
-            f"Retrieval time for {B} samples: "
-            f"{self.last_retrieval_elapsed:.4f}s"
-        )
+        debug(f"Retrieval time for {B} samples: {self.last_retrieval_elapsed:.4f}s")
 
         if return_idx:
             return results, scores, idxs

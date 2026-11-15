@@ -1,38 +1,13 @@
 import math
-import re
 import warnings
-from typing import Any, Dict, List, Union
+from typing import List
 
 import datasets
-import numpy as np
 from transformers import AutoModel, AutoTokenizer
 
 from mnemorag.utils import get_device
 
 _has_printed_instruction = False
-
-
-def convert_numpy(obj: Union[Dict, list, np.ndarray, np.generic]) -> Any:
-    """Recursively convert numpy objects in nested dictionaries or lists to native Python types."""
-    if isinstance(obj, dict):
-        return {k: convert_numpy(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_numpy(i) for i in obj]
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, (np.integer, np.floating)):
-        return obj.item()
-    elif isinstance(obj, np.float32):
-        return float(obj)
-    else:
-        return obj
-
-
-def judge_zh(input_str: str):
-    assert isinstance(input_str, str), input_str
-    if len(input_str) == 0:
-        return False
-    return bool(re.search(r"[\u4e00-\u9fff]", input_str))
 
 
 def load_model(model_path: str, use_fp16: bool = False):
@@ -69,26 +44,6 @@ def pooling(
         raise NotImplementedError("Pooling method not implemented!")
 
 
-def set_default_instruction(model_name, is_query=True, is_zh=False):
-    instruction = ""
-    if "e5" in model_name.lower():
-        if is_query:
-            instruction = "query: "
-        else:
-            instruction = "passage: "
-
-    if "bge" in model_name.lower():
-        if is_query:
-            if "zh" in model_name.lower() or is_zh:
-                instruction = "为这个句子生成表示以用于检索相关文章："
-            else:
-                instruction = (
-                    "Represent this sentence for searching relevant passages: "
-                )
-
-    return instruction
-
-
 def parse_query(model_name, query_list, instruction=None, is_query=True):
     """Apply the retrieval instruction expected by the embedding model."""
     global _has_printed_instruction
@@ -99,14 +54,12 @@ def parse_query(model_name, query_list, instruction=None, is_query=True):
     if instruction is not None:
         instruction = instruction.strip() + " "
     else:
-        instruction = set_default_instruction(
-            model_name, is_query=is_query, is_zh=judge_zh(query_list[0])
-        )
+        instruction = "query: " if is_query else "passage: "
     if not _has_printed_instruction:
         if instruction == "":
             warnings.warn("Instruction is not set")
         else:
-            print(f"Use `{instruction}` as retreival instruction")
+            print(f"Use `{instruction}` as retrieval instruction")
         _has_printed_instruction = True
 
     query_list = [instruction + query for query in query_list]
@@ -119,7 +72,6 @@ def load_corpus(corpus_path: str):
         corpus = datasets.load_dataset("json", data_files=corpus_path, split="train")
     elif corpus_path.endswith(".parquet"):
         corpus = datasets.load_dataset("parquet", data_files=corpus_path, split="train")
-        corpus = corpus.cast_column("image", datasets.Image())
     else:
         raise NotImplementedError("Corpus format not supported!")
     if "contents" not in corpus.features:
@@ -151,13 +103,6 @@ def load_docs(corpus, doc_idxs: List[int]):
     return [corpus[idx] for idx in indices]
 
 
-def align_probe_count(n: int) -> int:
-    """Round a probe count up to the nearest power of two."""
-    if n <= 1:
-        return 1
-    return 1 << (n - 1).bit_length()
-
-
 def adaptive_probe_budget(
     similarity: float,
     similarity_low: float,
@@ -183,24 +128,8 @@ def adaptive_probe_budget(
         similarity_high - similarity_low
     )
     normalized = min(1.0, max(0.0, normalized))
-    if curve == "power_decay":
-        budget_fraction = math.pow(1.0 - normalized, gamma)
-    elif curve == "late_decay":
-        budget_fraction = 1.0 - math.pow(normalized, gamma)
-    else:
-        raise ValueError("similarity_nprobe_curve must be power_decay or late_decay")
-    continuous = minimum + (maximum - minimum) * budget_fraction
-    if rounding == "ceil":
-        budget = math.ceil(continuous - 1e-12)
-    elif rounding == "nearest":
-        budget = math.floor(continuous + 0.5)
-    elif rounding == "floor":
-        budget = math.floor(continuous + 1e-12)
-    elif rounding == "power_of_two":
-        budget = align_probe_count(math.floor(continuous + 1e-12))
-    else:
-        raise ValueError(
-            "similarity_nprobe_rounding must be one of: "
-            "ceil, nearest, floor, power_of_two"
-        )
+    if curve != "power_decay" or rounding != "ceil":
+        raise ValueError("The paper probe rule uses power_decay and ceil")
+    continuous = minimum + (maximum - minimum) * math.pow(1.0 - normalized, gamma)
+    budget = math.ceil(continuous - 1e-12)
     return min(maximum, max(minimum, int(budget)))

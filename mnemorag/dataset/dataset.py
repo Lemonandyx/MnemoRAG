@@ -60,7 +60,7 @@ class Item:
             self.update_output(key, value)
 
     def to_dict(self) -> dict[str, Any]:
-        from mnemorag.dataset.utils import clean_prompt_images, convert_numpy
+        from mnemorag.dataset.utils import convert_numpy
 
         result = {
             key: convert_numpy(value)
@@ -68,8 +68,6 @@ class Item:
             if key != "output"
         }
         output = convert_numpy(self.output)
-        if "prompt" in output:
-            output["prompt"] = clean_prompt_images(output["prompt"])
         result["output"] = output
         return result
 

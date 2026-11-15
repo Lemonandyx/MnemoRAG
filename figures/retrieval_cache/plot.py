@@ -18,20 +18,30 @@ MARKERS = ("D", "o", "s", "^", "v")
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("results", type=Path)
+    parser.add_argument("--dataset")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     rows = []
-    for path in args.results.glob("*/summary.json"):
+    for path in args.results.rglob("summary.json"):
         row = json.loads(path.read_text(encoding="utf-8"))
-        if row.get("status") == "complete" and row.get("system"):
+        if (
+            row.get("status") == "complete"
+            and row.get("system")
+            and not row.get("quality_reference_only", False)
+            and (args.dataset is None or row.get("dataset") == args.dataset)
+        ):
+            row["arrival_rate_rps"] = row.get(
+                "arrival_rate_qps", row.get("arrival_rate_rps")
+            )
             rows.append(row)
     if not rows:
         raise ValueError("no complete result summaries were found")
+    if len({row.get("dataset") for row in rows}) > 1:
+        raise ValueError("specify --dataset to plot one dataset at a time")
     systems = tuple(dict.fromkeys(row["system"] for row in rows))
     nprobes = tuple(sorted({int(row["nprobe"]) for row in rows}))
     styles = {
-        system: style
-        for system, style in zip(systems, cycle(zip(COLORS, MARKERS)))
+        system: style for system, style in zip(systems, cycle(zip(COLORS, MARKERS)))
     }
     plt.rcParams.update(
         {

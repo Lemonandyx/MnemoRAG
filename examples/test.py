@@ -116,13 +116,15 @@ def main() -> None:
 
     started = time.perf_counter()
     pipeline = AsyncPipeline(config, prompt_template=prompt)
-    output = asyncio.run(pipeline.run_stream(Dataset(data=rows), do_eval=False))
+    try:
+        output = asyncio.run(pipeline.run_stream(Dataset(data=rows), do_eval=False))
+    finally:
+        pipeline.close()
     elapsed = time.perf_counter() - started
     print(f"MNEMORAG_TEST_OK requests={len(output)} elapsed_s={elapsed:.3f}")
     print(f"async_engine={pipeline.generator.use_persistent_async_engine}")
     print(f"hotness_enabled={pipeline.document_pool.enable_hotness}")
 
-    pipeline.generator.model.shutdown()
     sys.stdout.flush()
     sys.stderr.flush()
 

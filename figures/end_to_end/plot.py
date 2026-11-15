@@ -20,11 +20,7 @@ MARKERS = ("o", "^", "d", "s", "v")
 
 def load_rows(path: Path) -> list[dict[str, str]]:
     with path.open(newline="", encoding="utf-8") as stream:
-        return [
-            row
-            for row in csv.DictReader(stream)
-            if row.get("headline_eligible", "true").lower() == "true"
-        ]
+        return list(csv.DictReader(stream))
 
 
 def main() -> None:
@@ -50,8 +46,7 @@ def main() -> None:
     workflows = tuple(dict.fromkeys(row["workflow"] for row in rows))
     systems = tuple(dict.fromkeys(row["system"] for row in rows))
     styles = {
-        system: style
-        for system, style in zip(systems, cycle(zip(COLORS, MARKERS)))
+        system: style for system, style in zip(systems, cycle(zip(COLORS, MARKERS)))
     }
     plt.rcParams.update(
         {
@@ -85,12 +80,7 @@ def main() -> None:
                 if not selected:
                     continue
                 x = [float(row["qps"]) for row in selected]
-                raw_y = [float(row["mean_latency_s"]) for row in selected]
-                y = (
-                    [min(value, args.slo_seconds) for value in raw_y]
-                    if args.slo_seconds is not None
-                    else raw_y
-                )
+                y = [float(row["mean_latency_s"]) for row in selected]
                 axis.plot(
                     x,
                     y,
@@ -107,9 +97,7 @@ def main() -> None:
                     linestyle="--",
                     linewidth=0.8,
                 )
-                axis.set_ylim(0, args.slo_seconds)
-            else:
-                axis.set_ylim(bottom=0)
+            axis.set_ylim(bottom=0)
             axis.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.45)
             axis.set_title(
                 f"{dataset} · {workflow}",

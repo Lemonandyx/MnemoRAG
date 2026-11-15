@@ -157,28 +157,13 @@ def candidate_groups(
     return groups
 
 
-def _passes_slo(
-    summary: Mapping[str, object],
-    *,
-    minimum_attainment: float,
-    latency_slo_seconds: float,
-) -> bool:
-    return bool(
-        float(summary["slo_attainment"]) >= minimum_attainment
-        and float(summary["request_latency_p99_s"]) <= latency_slo_seconds
-    )
-
-
 def select_boundary_qps(
     candidate_summaries: Iterable[Mapping[str, object]],
     *,
-    minimum_attainment: float = 0.99,
     latency_slo_seconds: float = 10.0,
     nprobes: Sequence[int] = NPROBES,
 ) -> dict[tuple[str, int], tuple[float, ...]]:
     """Select a shared bracket around every system's observed SLO boundary."""
-    if not 0 < minimum_attainment <= 1:
-        raise ValueError("minimum_attainment must be in (0, 1]")
     grouped: dict[tuple[str, int, str], list[Mapping[str, object]]] = defaultdict(list)
     for summary in candidate_summaries:
         key = (
@@ -202,18 +187,23 @@ def select_boundary_qps(
     for (workflow, nprobe, system), rows in grouped.items():
         by_qps = {float(row["arrival_rate_rps"]): row for row in rows}
         expected_qps = tuple(map(float, QPS_GRIDS[workflow]))
-        if tuple(sorted(by_qps)) != expected_qps:
+        observed_qps = tuple(sorted(by_qps))
+        if observed_qps != expected_qps[: len(observed_qps)]:
             raise ValueError(
                 f"candidate QPS grid mismatch for {(workflow, nprobe, system)}"
             )
+        if (
+            len(observed_qps) < len(expected_qps)
+            and float(by_qps[observed_qps[-1]]["request_latency_mean_s"])
+            <= latency_slo_seconds
+        ):
+            raise ValueError(
+                "a truncated scan must include its first mean-latency SLO violation"
+            )
         passing = [
             index
-            for index, qps in enumerate(expected_qps)
-            if _passes_slo(
-                by_qps[qps],
-                minimum_attainment=minimum_attainment,
-                latency_slo_seconds=latency_slo_seconds,
-            )
+            for index, qps in enumerate(observed_qps)
+            if float(by_qps[qps]["request_latency_mean_s"]) <= latency_slo_seconds
         ]
         if not passing:
             indices = range(min(2, len(expected_qps)))
@@ -230,7 +220,6 @@ def select_boundary_qps_by_dataset(
     candidate_summaries: Iterable[Mapping[str, object]],
     *,
     datasets: Sequence[str] = DATASETS,
-    minimum_attainment: float = 0.99,
     latency_slo_seconds: float = 10.0,
     nprobes: Sequence[int] = NPROBES,
 ) -> dict[tuple[str, str, int], tuple[float, ...]]:
@@ -242,7 +231,6 @@ def select_boundary_qps_by_dataset(
             raise ValueError(f"candidate scan is missing dataset: {dataset}")
         for (workflow, nprobe), qps_values in select_boundary_qps(
             dataset_rows,
-            minimum_attainment=minimum_attainment,
             latency_slo_seconds=latency_slo_seconds,
             nprobes=nprobes,
         ).items():

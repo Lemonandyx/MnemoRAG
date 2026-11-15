@@ -15,9 +15,9 @@ def base_command():
         "--order-mode",
         "hotness_hint",
         "--async-retrieval-policy",
-        "prefill_start",
+        "prefill_batch",
         "--cpu-kv-cache-gib",
-        "238.4",
+        "16",
         "--require-cpu-kv-h2d-samples",
         "--require-cpu-kv-d2h-samples",
     ]
@@ -53,7 +53,6 @@ def test_paper_ablation_order_and_vanilla_contract():
     assert option(vanilla, "--cpu-kv-cache-gib") == "0"
     assert "--no-document-kv-heat" in vanilla
     assert "--no-cross-microbatch-pipeline" in vanilla
-    assert "--no-cache-aware-prefill-batching" in vanilla
 
 
 def test_vanilla_removes_warmstart_artifacts():

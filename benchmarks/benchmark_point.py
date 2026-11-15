@@ -9,6 +9,11 @@ the query pool and vLLM prefix cache never leak across experimental points.
 from __future__ import annotations
 
 import argparse
+
+try:
+    from .quality import exact_retrieval_recall
+except ImportError:
+    from quality import exact_retrieval_recall
 import asyncio
 import copy
 import csv
@@ -95,7 +100,6 @@ MNEMORAG_VLLM_ROOT = Path(
 DATASET_PATHS = {
     "nq": ASSET_ROOT / "qa/datasets/nq/train.jsonl",
     "hotpotqa": ASSET_ROOT / "qa/datasets/hotpotqa/train.jsonl",
-    "webquestions": ASSET_ROOT / "qa/datasets/web_questions/train.jsonl",
     "squad": ASSET_ROOT / "qa/datasets/squad/squad_dev.jsonl",
     "2wikimultihopqa": ASSET_ROOT / "qa/datasets/2wikimultihopqa/train.jsonl",
 }
@@ -265,8 +269,7 @@ def release_startup_gpu_reservation(handle: dict | None) -> dict | None:
     if not report["released"] or process.exitcode != 0:
         raise RuntimeError(f"Startup GPU reservation did not exit cleanly: {report}")
     print(
-        "Startup GPU reservation released: "
-        + json.dumps(report, sort_keys=True),
+        "Startup GPU reservation released: " + json.dumps(report, sort_keys=True),
         flush=True,
     )
     return report
@@ -364,9 +367,7 @@ def resolve_paper_similarity_thresholds(
     resolved_reuse = default_reuse if tau_reuse is None else float(tau_reuse)
     resolved_guided = default_guided if tau_guided is None else float(tau_guided)
     if not 0.0 <= resolved_guided <= resolved_reuse <= 1.0:
-        raise ValueError(
-            "thresholds must satisfy 0 <= tau-guided <= tau-reuse <= 1"
-        )
+        raise ValueError("thresholds must satisfy 0 <= tau-guided <= tau-reuse <= 1")
     return resolved_reuse, resolved_guided
 
 
@@ -439,27 +440,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nprobe", type=int, choices=(128, 256, 512), default=128)
     parser.add_argument("--retrieval-batch-size", type=int, default=64)
     parser.add_argument("--microbatch-size", type=int, default=64)
-    parser.add_argument(
-        "--cache-aware-prefill-batching",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Keep CPU-KV-ready and cold prompts in separate generation "
-            "batches without waiting for future arrivals."
-        ),
-    )
     parser.add_argument("--worker-count", type=int, default=8)
     parser.add_argument(
         "--async-retrieval-policy",
-        choices=(
-            "prefill_start",
-            "prefill_batch",
-            "stage_aware",
-            "adaptive",
-            "sequential",
-            "fixed_delay",
-            "eager",
-        ),
+        choices=("prefill_batch", "sequential"),
         default="prefill_batch",
     )
     parser.add_argument(
@@ -472,28 +456,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--direct-vllm-dispatch",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "Submit each retrieval-ready request directly to vLLM continuous "
-            "batching without an application-side generation-stage gate."
-        ),
-    )
-    parser.add_argument("--async-fixed-delay-ms", type=float, default=60.0)
-    parser.add_argument(
         "--async-generation-queue-batches",
         type=int,
         default=2,
         help="Maximum outstanding generation microbatches before backpressure.",
     )
-    parser.add_argument("--async-adaptive-ema-alpha", type=float, default=0.25)
-    parser.add_argument(
-        "--async-adaptive-max-prefill-overlap-fraction",
-        type=float,
-        default=0.5,
-    )
-    parser.add_argument("--async-adaptive-safety-margin-ms", type=float, default=5.0)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
         "--ignore-eos",
@@ -606,7 +573,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--similarity-nprobe-normalization",
-        choices=("cumulative", "threshold"),
+        choices=("cumulative",),
         default="cumulative",
         help=(
             "Similarity range used by Equation (2). The paper contract uses "
@@ -641,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--similarity-nprobe-curve",
-        choices=("power_decay", "late_decay"),
+        choices=("power_decay",),
         default=None,
         help=(
             "Optional similarity-aware probe-budget curve; omitted keeps "
@@ -662,7 +629,7 @@ def parse_args() -> argparse.Namespace:
             "Disable only for the nprobe-only ablation."
         ),
     )
-    parser.add_argument("--irg-rounds", type=int, default=2)
+    parser.add_argument("--irg-rounds", type=int, default=3)
     parser.add_argument(
         "--cpu-kv-cache-gib",
         type=float,
@@ -883,8 +850,8 @@ def derive_cpu_kv_layout(
         raise ValueError("--cpu-kv-block-size must be positive")
     if args.cpu_kv_h2d_max_group_requests < 0:
         raise ValueError("--cpu-kv-h2d-max-group-requests must be nonnegative")
-    if args.cpu_kv_min_document_heat_to_store < 1:
-        raise ValueError("--cpu-kv-min-document-heat-to-store must be at least one")
+    if args.cpu_kv_min_document_heat_to_store < 0:
+        raise ValueError("--cpu-kv-min-document-heat-to-store must be nonnegative")
     if args.cpu_kv_pinned_tier_gib < 0:
         raise ValueError("--cpu-kv-pinned-tier-gib must be nonnegative")
     if (
@@ -939,9 +906,7 @@ def derive_cpu_kv_layout(
     pinned_tier_blocks = min(num_cpu_blocks, pinned_tier_bytes // block_bytes)
     if num_cpu_blocks < 1:
         raise ValueError("--cpu-kv-cache-gib is smaller than one KV block")
-    lazy_mmap_dir = Path(
-        getattr(args, "cpu_kv_lazy_mmap_dir", Path("/dev/shm"))
-    )
+    lazy_mmap_dir = Path(getattr(args, "cpu_kv_lazy_mmap_dir", Path("/dev/shm")))
     if args.cpu_kv_host_memory_mode == "hybrid_pinned_lazy":
         if not lazy_mmap_dir.is_dir():
             raise ValueError(
@@ -1225,9 +1190,6 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
         os.environ.pop("VLLM_MAX_NUM_BATCHED_TOKENS", None)
     os.environ["VLLM_GPU_MEMORY_UTILIZATION"] = str(args.gpu_memory_utilization)
     os.environ["VLLM_KV_CACHE_DTYPE"] = args.kv_cache_dtype
-    os.environ["MNEMORAG_T_REUSE"] = str(args.tau_reuse)
-    os.environ["MNEMORAG_T_GUIDED"] = str(args.tau_guided)
-    os.environ["MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"] = "1"
     os.environ["MNEMORAG_FAISS_PREASSIGNED_GUIDANCE"] = (
         "1" if args.preassigned_guidance else "0"
     )
@@ -1328,8 +1290,7 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
     args.numa_policy = current_numa_policy()
     args.numa_pages_before = current_numa_page_counts()
     print(
-        "Resource preflight: "
-        + json.dumps(args.resource_preflight, sort_keys=True),
+        "Resource preflight: " + json.dumps(args.resource_preflight, sort_keys=True),
         flush=True,
     )
     print(
@@ -2114,7 +2075,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             "generator_model": "llama3-8B-instruct",
             "retrieval_method": "e5",
             "framework": "vllm",
-            "metrics": ["retrieval_recall", "f1", "acc"],
+            "metrics": ["f1", "acc"],
             "metric_setting": {
                 "retrieval_recall_topk": args.topk,
             },
@@ -2137,9 +2098,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             "enable_document_kv_heat": args.document_kv_heat,
             "similarity_t_reuse": args.tau_reuse,
             "similarity_t_guided": args.tau_guided,
-            "similarity_nprobe_normalization": (
-                args.similarity_nprobe_normalization
-            ),
+            "similarity_nprobe_normalization": (args.similarity_nprobe_normalization),
             "similarity_nprobe_min": similarity_nprobe_min,
             "similarity_nprobe_max": similarity_nprobe_max,
             "similarity_nprobe_gamma": args.similarity_nprobe_gamma,
@@ -2154,17 +2113,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             "faiss_mmap_index": args.faiss_mmap_index,
             "async_retrieval_policy": args.async_retrieval_policy,
             "async_cross_microbatch_pipeline": args.cross_microbatch_pipeline,
-            "direct_vllm_dispatch": args.direct_vllm_dispatch,
-            "cache_aware_prefill_batching": args.cache_aware_prefill_batching,
-            "async_fixed_delay_ms": args.async_fixed_delay_ms,
-            "async_generation_queue_batches": (
-                args.async_generation_queue_batches
-            ),
-            "async_adaptive_ema_alpha": args.async_adaptive_ema_alpha,
-            "async_adaptive_max_prefill_overlap_fraction": (
-                args.async_adaptive_max_prefill_overlap_fraction
-            ),
-            "async_adaptive_safety_margin_ms": (args.async_adaptive_safety_margin_ms),
+            "async_generation_queue_batches": (args.async_generation_queue_batches),
             "irg_max_iter": args.irg_rounds,
             "recomp_compression_max_tokens": (DEFAULT_RECOMP_COMPRESSION_MAX_TOKENS),
             "recomp_answer_max_tokens": args.max_tokens,
@@ -2625,9 +2574,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 prefix_recent_cached_tokens += cached_tokens
                 prefix_recent_prompt_tokens += prompt_tokens
                 if len(prefix_recent_requests) > 1000:
-                    expired_cached, expired_prompt = (
-                        prefix_recent_requests.popleft()
-                    )
+                    expired_cached, expired_prompt = prefix_recent_requests.popleft()
                     prefix_recent_cached_tokens -= expired_cached
                     prefix_recent_prompt_tokens -= expired_prompt
 
@@ -2748,6 +2695,27 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "permit_leak"
     ):
         raise RuntimeError("AsyncLLM generation admission permits leaked after the run")
+    runtime_monitor = getattr(args, "runtime_resource_monitor", None)
+    runtime_resource_summary = None
+    if runtime_monitor is not None:
+        runtime_monitor.checkpoint("workload:complete")
+        runtime_monitor.stop()
+        runtime_monitor.assert_clean()
+        runtime_resource_summary = runtime_monitor.summary()
+
+    final_queries = [
+        (item.output.get("retrieval_query_trajectory") or [item.question])[-1]
+        for item in output_dataset
+    ]
+    exact_recalls = exact_retrieval_recall(
+        pipeline.retriever.encoder,
+        pipeline.retriever.index,
+        final_queries,
+        [item.output["retrieval_idxs"] for item in output_dataset],
+        args.topk,
+    )
+    for item, recall in zip(output_dataset, exact_recalls):
+        item.update_evaluation_score("retrieval_recall", recall)
     metric_values = collect_quality_metric_values(output_dataset, args.num_requests)
     timing_fields = (
         "scheduled_arrival_offset_s",
@@ -2812,14 +2780,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 "E2E latency must span scheduled arrival to final completion "
                 f"for request {request_index}"
             )
-
-    runtime_monitor = getattr(args, "runtime_resource_monitor", None)
-    runtime_resource_summary = None
-    if runtime_monitor is not None:
-        runtime_monitor.checkpoint("workload:complete")
-        runtime_monitor.stop()
-        runtime_monitor.assert_clean()
-        runtime_resource_summary = runtime_monitor.summary()
 
     prompt_fingerprints = source_order_prompt_fingerprints(
         output_dataset, pipeline.generator.tokenizer
@@ -2993,10 +2953,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "serving_batch_size": args.microbatch_size,
         "request_batching_policy": scheduler_stats.get("request_batching_policy"),
         "preformed_work_queue": scheduler_stats.get("preformed_work_queue"),
-        "cache_aware_prefill_batching": args.cache_aware_prefill_batching,
-        "cache_aware_prefill_batching_stats": getattr(
-            pipeline, "_cache_aware_prefill_batching_stats", None
-        ),
         "max_num_batched_tokens": (args.max_num_batched_tokens or None),
         "vllm_engine_effective": vllm_engine_contract["values"],
         "vllm_engine_contract_audit": vllm_engine_contract,
@@ -3025,11 +2981,11 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "async_retrieval_policy": args.async_retrieval_policy,
         "async_retrieval_policy_effective": scheduler_stats.get(
             "effective_async_retrieval_policy",
-            "eager" if args.direct_vllm_dispatch else args.async_retrieval_policy,
+            args.async_retrieval_policy,
         ),
-        "direct_vllm_dispatch": args.direct_vllm_dispatch,
+        "direct_vllm_dispatch": False,
         "application_generation_gate": scheduler_stats.get(
-            "application_generation_gate", not args.direct_vllm_dispatch
+            "application_generation_gate", not False
         ),
         "generation_queue_capacity_batches": scheduler_stats.get(
             "generation_queue_capacity_batches"
@@ -3092,12 +3048,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             "prompt_lengths_sha256"
         ],
         "generation_prompt_source_order": prompt_fingerprints,
-        "async_fixed_delay_ms": args.async_fixed_delay_ms,
-        "async_adaptive_ema_alpha": args.async_adaptive_ema_alpha,
-        "async_adaptive_max_prefill_overlap_fraction": (
-            args.async_adaptive_max_prefill_overlap_fraction
-        ),
-        "async_adaptive_safety_margin_ms": args.async_adaptive_safety_margin_ms,
         "tau_reuse": args.tau_reuse,
         "tau_guided": args.tau_guided,
         "similarity_nprobe_budget": {
@@ -3116,7 +3066,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "ignore_eos": args.ignore_eos,
         "max_model_len": args.max_model_len,
         "gpu_memory_utilization": args.gpu_memory_utilization,
-        "kv_cache_dtype": args.kv_cache_dtype,
         "prefix_caching": args.prefix_caching,
         "model_path": str(ASSET_ROOT / "models/llama3-8B-instruct"),
         "retrieval_model_path": str(ASSET_ROOT / "models/e5-large-v2"),
@@ -3234,9 +3183,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
                 else None
             ),
             "max_hit_rate": (
-                max(
-                    sample["hit_rate"] for sample in prefix_periodic_recent_samples
-                )
+                max(sample["hit_rate"] for sample in prefix_periodic_recent_samples)
                 if prefix_periodic_recent_samples
                 else None
             ),
@@ -3267,9 +3214,9 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             for name, values in metric_values.items()
         },
         "metric_contract": {
-            "version": 2,
+            "version": 3,
             "retrieval": {
-                "name": "answer_hit_recall_at_k",
+                "name": "exact_neighbor_recall_at_k",
                 "k": args.topk,
                 "scope": "final_retrieval_round",
                 "denominator": "all_requests",

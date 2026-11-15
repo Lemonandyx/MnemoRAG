@@ -19,7 +19,6 @@ class BasicPipeline:
         self.device = config["device"]
         self.retriever = None
         self.evaluator = Evaluator(config)
-        self.save_retrieval_cache = config["save_retrieval_cache"]
         if prompt_template is None:
             prompt_template = PromptTemplate(config)
         self.prompt_template = prompt_template
@@ -47,16 +46,13 @@ class BasicPipeline:
             bind_tokenizer(tokenizer)
 
     def evaluate(self, dataset, do_eval=True, pred_process_fun=None):
-        """Evaluate predictions and optionally persist the retrieval cache."""
+        """Evaluate predictions from the serving run."""
         if pred_process_fun is not None:
             dataset = pred_process_fun(dataset)
 
         if do_eval:
             eval_result = self.evaluator.evaluate(dataset)
             print(eval_result)
-
-        if self.save_retrieval_cache:
-            self.retriever._save_cache()
 
         return dataset
 
@@ -76,55 +72,17 @@ class IRGState:
         self.stop_reason = None
 
 
-def _parse_cpu_set(value):
-    cpus = set()
-    for part in value.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if "-" in part:
-            start, end = (int(item) for item in part.split("-", 1))
-            cpus.update(range(start, end + 1))
-        else:
-            cpus.add(int(part))
-    return cpus
-
-
 class AsyncPipeline(BasicPipeline):
     def __init__(self, config, prompt_template=None, retriever=None, generator=None):
         initialization_started = time.perf_counter()
         initialization_profile = {}
         super().__init__(config, prompt_template)
-        retriever_first = os.environ.get("MNEMORAG_RETRIEVER_FIRST", "0") == "1"
-        if retriever_first:
-            retriever_cpus = _parse_cpu_set(
-                os.environ.get("MNEMORAG_RETRIEVER_CPUSET", "")
-            )
-            generator_cpus = _parse_cpu_set(
-                os.environ.get("MNEMORAG_GENERATOR_CPUSET", "")
-            )
-            if retriever_cpus:
-                os.sched_setaffinity(0, retriever_cpus)
-                print(f"Retriever CPU affinity: {sorted(retriever_cpus)}")
-            phase_started = time.perf_counter()
-            self.retriever = get_retriever(config) if retriever is None else retriever
-            initialization_profile["retriever_s"] = time.perf_counter() - phase_started
-
-            if generator_cpus:
-                os.sched_setaffinity(0, generator_cpus)
-                print(f"Generator CPU affinity: {sorted(generator_cpus)}")
-            phase_started = time.perf_counter()
-            self.generator = get_generator(config) if generator is None else generator
-            initialization_profile["generator_s"] = time.perf_counter() - phase_started
-            if retriever_cpus:
-                os.sched_setaffinity(0, retriever_cpus)
-        else:
-            phase_started = time.perf_counter()
-            self.generator = get_generator(config) if generator is None else generator
-            initialization_profile["generator_s"] = time.perf_counter() - phase_started
-            phase_started = time.perf_counter()
-            self.retriever = get_retriever(config) if retriever is None else retriever
-            initialization_profile["retriever_s"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        self.generator = get_generator(config) if generator is None else generator
+        initialization_profile["generator_s"] = time.perf_counter() - phase_started
+        phase_started = time.perf_counter()
+        self.retriever = get_retriever(config) if retriever is None else retriever
+        initialization_profile["retriever_s"] = time.perf_counter() - phase_started
 
         self._bind_prompt_tokenizer()
 
@@ -375,17 +333,27 @@ class AsyncPipeline(BasicPipeline):
         self._cross_microbatch_previous_gate = None
         self._cross_microbatch_previous_prefill_gate = None
         self._cross_microbatch_trace = []
-        self._cross_microbatch_adaptive_state = {
-            "retrieval_ema_s": None,
-            "prefill_ema_s": None,
-            "decode_ema_s": None,
-        }
-        self._cross_microbatch_observed_retrieval_batches = set()
-        self._cross_microbatch_observed_generation_batches = set()
         # Workloads may be launched by separate asyncio.run() calls. Recreate
         # the lock so it is never retained from an earlier event loop or a
         # failed workload.
         self._cross_microbatch_lock = asyncio.Lock()
+
+    async def _wait_for_prefill_or_completion(self, prefill_event, generation_task):
+        event_ready = asyncio.create_task(prefill_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {event_ready, generation_task},
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=float(self._config_or("async_scheduler_gate_timeout_s", 120.0)),
+            )
+            if not done:
+                raise TimeoutError("Timed out waiting for full-batch prefill admission")
+            if generation_task in done:
+                generation_task.result()
+        finally:
+            if not event_ready.done():
+                event_ready.cancel()
+            await asyncio.gather(event_ready, return_exceptions=True)
 
     async def _acquire_prefill_batch_cross_slot(self):
         """Serialize outer workflow batches at the full-prefill boundary."""
@@ -407,9 +375,7 @@ class AsyncPipeline(BasicPipeline):
                 ),
             )
             if not done:
-                raise TimeoutError(
-                    "Timed out waiting for full-batch prefill admission"
-                )
+                raise TimeoutError("Timed out waiting for full-batch prefill admission")
             if generation_task in done:
                 generation_task.result()
         except BaseException:
@@ -428,7 +394,7 @@ class AsyncPipeline(BasicPipeline):
         self._cross_microbatch_lock.release()
 
     @staticmethod
-    def summarize_scheduler_trace(trace, policy, adaptive_state=None):
+    def summarize_scheduler_trace(trace, policy):
         overlap_coverages = []
         prefill_overlap_coverages = []
         generation_overlap_coverages = []
@@ -583,7 +549,6 @@ class AsyncPipeline(BasicPipeline):
                 if prefill_observer_delay_s
                 else 0.0
             ),
-            "adaptive_estimates": adaptive_state,
         }
 
     async def _generate_async_safe(
@@ -910,9 +875,7 @@ class AsyncPipeline(BasicPipeline):
         generate_time_st = time.time()
         pred_answer_list = self.generator.generate(input_prompts)
         generate_time_ed = time.time()
-        print(
-            f"generate time: {generate_time_ed - generate_time_st:.4f} seconds"
-        )
+        print(f"generate time: {generate_time_ed - generate_time_st:.4f} seconds")
 
         dataset.update_output("pred", pred_answer_list)
 
@@ -928,47 +891,13 @@ class AsyncPipeline(BasicPipeline):
         queries = dataset.question
         R = self.config["retrieval_batch_size"]
         total_n = len(queries)
-        cache_aware_prefill_batching = bool(
-            self._config_or("cache_aware_prefill_batching", False)
-        )
-        direct_vllm_dispatch = bool(self._config_or("direct_vllm_dispatch", False))
         cross_microbatch_enabled = (
             bool(self._config_or("async_cross_microbatch_pipeline", True))
-            and (cache_aware_prefill_batching or total_n <= R)
-            and not direct_vllm_dispatch
+            and total_n <= R
         )
-        configured_policy = str(
-            self._config_or("async_retrieval_policy", "prefill_batch")
-        ).lower()
-        policy = "eager" if direct_vllm_dispatch else configured_policy
-        if policy not in {
-            "stage_aware",
-            "prefill_start",
-            "prefill_batch",
-            "adaptive",
-            "sequential",
-            "fixed_delay",
-            "eager",
-        }:
+        policy = str(self._config_or("async_retrieval_policy", "prefill_batch")).lower()
+        if policy not in {"prefill_batch", "sequential"}:
             raise ValueError(f"Unsupported async_retrieval_policy: {policy}")
-        fixed_delay_s = float(self._config_or("async_fixed_delay_ms", 60.0)) / 1000.0
-        adaptive_alpha = min(
-            1.0,
-            max(0.01, float(self._config_or("async_adaptive_ema_alpha", 0.25))),
-        )
-        adaptive_max_prefill_fraction = min(
-            1.0,
-            max(
-                0.0,
-                float(
-                    self._config_or("async_adaptive_max_prefill_overlap_fraction", 0.5)
-                ),
-            ),
-        )
-        adaptive_margin_s = max(
-            0.0,
-            float(self._config_or("async_adaptive_safety_margin_ms", 5.0)) / 1000.0,
-        )
         gate_timeout_s = max(
             0.01,
             float(self._config_or("async_scheduler_gate_timeout_s", 120.0)),
@@ -987,27 +916,6 @@ class AsyncPipeline(BasicPipeline):
         all_generation_dispatch_times = [None] * total_n
         all_generation_completion_times = [None] * total_n
         scheduler_trace = []
-        if cross_microbatch_enabled:
-            if not hasattr(self, "_cross_microbatch_adaptive_state"):
-                self.reset_cross_microbatch_scheduler()
-            adaptive_state = self._cross_microbatch_adaptive_state
-            observed_retrieval_batches = (
-                self._cross_microbatch_observed_retrieval_batches
-            )
-            observed_generation_batches = (
-                self._cross_microbatch_observed_generation_batches
-            )
-            adaptive_trace = self._cross_microbatch_trace
-        else:
-            adaptive_state = {
-                "retrieval_ema_s": None,
-                "prefill_ema_s": None,
-                "decode_ema_s": None,
-            }
-            observed_retrieval_batches = set()
-            observed_generation_batches = set()
-            adaptive_trace = scheduler_trace
-
         generation_tasks = []
         pending_completions = set()
         generation_queue_high_water = 0
@@ -1122,9 +1030,7 @@ class AsyncPipeline(BasicPipeline):
                 )
                 for task in done:
                     task.result()
-                active_tasks = [
-                    task for task in generation_tasks if not task.done()
-                ]
+                active_tasks = [task for task in generation_tasks if not task.done()]
             (
                 batch_indices,
                 _,
@@ -1145,41 +1051,6 @@ class AsyncPipeline(BasicPipeline):
             # Let the task enter the shared AsyncLLM admission limiter now.
             await asyncio.sleep(0)
 
-        def update_ema(name, value):
-            previous = adaptive_state[name]
-            adaptive_state[name] = (
-                value
-                if previous is None
-                else adaptive_alpha * value + (1.0 - adaptive_alpha) * previous
-            )
-
-        def update_adaptive_estimates():
-            for trace in adaptive_trace:
-                batch_id = trace.get("cross_batch_id", trace["batch_id"])
-                if (
-                    batch_id not in observed_retrieval_batches
-                    and "retrieval_end_s" in trace
-                ):
-                    update_ema(
-                        "retrieval_ema_s",
-                        trace["retrieval_end_s"] - trace["retrieval_start_s"],
-                    )
-                    observed_retrieval_batches.add(batch_id)
-                if (
-                    batch_id not in observed_generation_batches
-                    and "generation_end_s" in trace
-                    and "decode_ready_s" in trace
-                ):
-                    update_ema(
-                        "prefill_ema_s",
-                        trace["decode_ready_s"] - trace["generation_start_s"],
-                    )
-                    update_ema(
-                        "decode_ema_s",
-                        trace["generation_end_s"] - trace["decode_ready_s"],
-                    )
-                    observed_generation_batches.add(batch_id)
-
         async def wait_until_event_or_completion(event, completion, label):
             event_ready = asyncio.create_task(event.wait())
             done, _ = await asyncio.wait(
@@ -1199,61 +1070,19 @@ class AsyncPipeline(BasicPipeline):
                 event_ready.cancel()
                 await asyncio.gather(event_ready, return_exceptions=True)
 
-        async def wait_until_first_token_or_completion(first_token_event, completion):
-            await wait_until_event_or_completion(
-                first_token_event, completion, "the first token"
-            )
-
         async def wait_for_retrieval_window(
             first_token_event,
             generation_started_event,
             completion,
             trace,
         ):
-            if policy == "eager":
-                return
-            if policy == "fixed_delay":
-                await asyncio.wait_for(
-                    generation_started_event.wait(), timeout=gate_timeout_s
-                )
-                trace.setdefault(
-                    "generation_start_s",
-                    getattr(
-                        generation_started_event,
-                        "mnemorag_set_time_s",
-                        time.perf_counter(),
-                    ),
-                )
-                remaining = (
-                    trace["generation_start_s"] + fixed_delay_s - time.perf_counter()
-                )
-                if remaining <= 0:
-                    return
-                timer = asyncio.create_task(asyncio.sleep(remaining))
-                done, _ = await asyncio.wait(
-                    {timer, completion},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if completion in done:
-                    completion.result()
-                if not timer.done():
-                    timer.cancel()
-                    await asyncio.gather(timer, return_exceptions=True)
-                return
             if policy == "sequential":
                 await asyncio.wait_for(
                     asyncio.shield(completion), timeout=gate_timeout_s
                 )
-                return
-            if policy in {"prefill_start", "prefill_batch"}:
+            else:
                 await wait_until_event_or_completion(
-                    generation_started_event,
-                    completion,
-                    (
-                        "first prefill admission"
-                        if policy == "prefill_start"
-                        else "full-batch prefill admission"
-                    ),
+                    generation_started_event, completion, "full-batch prefill admission"
                 )
                 if generation_started_event.is_set():
                     trace.setdefault(
@@ -1264,71 +1093,6 @@ class AsyncPipeline(BasicPipeline):
                             time.perf_counter(),
                         ),
                     )
-                return
-            if policy == "stage_aware":
-                await wait_until_first_token_or_completion(
-                    first_token_event, completion
-                )
-                return
-
-            update_adaptive_estimates()
-            retrieval_ema = adaptive_state["retrieval_ema_s"]
-            prefill_ema = adaptive_state["prefill_ema_s"]
-            decode_ema = adaptive_state["decode_ema_s"]
-            if None in (retrieval_ema, prefill_ema, decode_ema):
-                trace["adaptive_gate"] = "stage_aware_warmup"
-                await wait_until_first_token_or_completion(
-                    first_token_event, completion
-                )
-                return
-
-            required_lead = max(0.0, retrieval_ema + adaptive_margin_s - decode_ema)
-            prefill_lead = min(
-                required_lead,
-                prefill_ema * adaptive_max_prefill_fraction,
-            )
-            delay_after_generation_start = max(0.0, prefill_ema - prefill_lead)
-            trace["adaptive_gate"] = "predictive"
-            trace["adaptive_retrieval_ema_s"] = retrieval_ema
-            trace["adaptive_prefill_ema_s"] = prefill_ema
-            trace["adaptive_decode_ema_s"] = decode_ema
-            trace["adaptive_prefill_lead_s"] = prefill_lead
-
-            await asyncio.wait_for(
-                generation_started_event.wait(), timeout=gate_timeout_s
-            )
-            trace.setdefault(
-                "generation_start_s",
-                getattr(
-                    generation_started_event,
-                    "mnemorag_set_time_s",
-                    time.perf_counter(),
-                ),
-            )
-            trace["adaptive_retrieval_target_s"] = (
-                trace["generation_start_s"] + delay_after_generation_start
-            )
-            remaining = trace["adaptive_retrieval_target_s"] - time.perf_counter()
-            if remaining <= 0:
-                return
-            timer = asyncio.create_task(asyncio.sleep(remaining))
-            decode_ready = asyncio.create_task(first_token_event.wait())
-            done, _ = await asyncio.wait(
-                {timer, decode_ready, completion},
-                return_when=asyncio.FIRST_COMPLETED,
-                timeout=gate_timeout_s,
-            )
-            if not done:
-                for task in (timer, decode_ready):
-                    task.cancel()
-                await asyncio.gather(timer, decode_ready, return_exceptions=True)
-                raise TimeoutError("Timed out waiting for the adaptive retrieval gate")
-            if completion in done:
-                completion.result()
-            for task in (timer, decode_ready):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(timer, decode_ready, return_exceptions=True)
 
         cross_lock_held = False
         cross_previous_gate = None
@@ -1354,213 +1118,11 @@ class AsyncPipeline(BasicPipeline):
             cross_lock_held = False
             cross_previous_gate = None
 
-        async def enqueue_cache_aware_records(records):
-            """Atomically classify and submit one retrieval-ready chunk."""
-            nonlocal cross_lock_held, cross_previous_gate
-
-            # Refresh heat after this chunk is retrieved. The first occurrence
-            # seeds CPU KV; later occurrences may then follow the ready path.
-            for record in records:
-                spans = record["document_heat_spans"] or ()
-                for span, doc_id in zip(spans, record["retrieval_idxs"]):
-                    span["heat"] = max(1, self.document_pool.get_count(doc_id))
-                record["document_heat"] = max(
-                    (float(span["heat"]) for span in spans),
-                    default=1.0,
-                )
-
-            loop = asyncio.get_running_loop()
-            if getattr(self, "_cache_aware_state_loop", None) is not loop:
-                old_lock = getattr(self, "_cache_aware_state_lock", None)
-                if old_lock is not None and old_lock.locked():
-                    raise RuntimeError(
-                        "cache-aware admission is active on another event loop"
-                    )
-                self._cache_aware_state_loop = loop
-                self._cache_aware_state_lock = asyncio.Lock()
-
-            # Classification, submission order, the seen set, and statistics
-            # form one state transition shared by all online workflow workers.
-            async with self._cache_aware_state_lock:
-                seen_documents = getattr(
-                    self, "_cache_aware_generated_documents", None
-                )
-                if seen_documents is None:
-                    seen_documents = set()
-                    self._cache_aware_generated_documents = seen_documents
-                seeded_in_chunk = set()
-                cold_records = []
-                ready_records = []
-                for record in records:
-                    key = record["retrieval_idxs"]
-                    if key in seen_documents or key in seeded_in_chunk:
-                        ready_records.append(record)
-                    else:
-                        cold_records.append(record)
-                        if record["document_heat"] > 1.0:
-                            seeded_in_chunk.add(key)
-
-                cold_records.sort(
-                    key=lambda record: (
-                        -record["document_heat"],
-                        record["request_index"],
-                    )
-                )
-                ready_records.sort(
-                    key=lambda record: (
-                        record["retrieval_idxs"],
-                        record["request_index"],
-                    )
-                )
-
-                batching_stats = getattr(
-                    self,
-                    "_cache_aware_prefill_batching_stats",
-                    {
-                        "admission_batches": 0,
-                        "cold_requests": 0,
-                        "ready_requests": 0,
-                        "cold_batches": 0,
-                        "ready_batches": 0,
-                        "completion_barrier": False,
-                        "submission_policy": "cold_then_ready_nonblocking",
-                    },
-                )
-                batching_stats["admission_batches"] += 1
-                batching_stats["cold_requests"] += len(cold_records)
-                batching_stats["ready_requests"] += len(ready_records)
-
-                for batch_kind, ordered_records in (
-                    ("cold", cold_records),
-                    ("ready", ready_records),
-                ):
-                    for start in range(0, len(ordered_records), R):
-                        generation_records = ordered_records[start : start + R]
-                        if not generation_records:
-                            continue
-                        batching_stats[f"{batch_kind}_batches"] += 1
-                        trace = {
-                            "batch_id": len(scheduler_trace),
-                            "batch_size": len(generation_records),
-                            "cache_aware_batch_kind": batch_kind,
-                            "retrieval_start_s": min(
-                                record["retrieval_start_s"]
-                                for record in generation_records
-                            ),
-                            "retrieval_end_s": max(
-                                record["retrieval_end_s"]
-                                for record in generation_records
-                            ),
-                            "prompt_ready_s": max(
-                                record["prompt_ready_s"]
-                                for record in generation_records
-                            ),
-                        }
-                        scheduler_trace.append(trace)
-                        if cross_microbatch_enabled:
-                            trace["cross_batch_id"] = len(
-                                self._cross_microbatch_trace
-                            )
-                            self._cross_microbatch_trace.append(trace)
-                        first_token_event = asyncio.Event()
-                        generation_started_event = asyncio.Event()
-                        completion = asyncio.get_running_loop().create_future()
-                        pending_completions.add(completion)
-                        completion.add_done_callback(observe_completion)
-                        if cross_microbatch_enabled and not cross_lock_held:
-                            await acquire_cross_slot(wait_for_retrieval=False)
-                        await enqueue_generation(
-                            (
-                                [
-                                    record["request_index"]
-                                    for record in generation_records
-                                ],
-                                [record["prompt"] for record in generation_records],
-                                [
-                                    record["document_heat_spans"]
-                                    for record in generation_records
-                                ],
-                                first_token_event,
-                                generation_started_event,
-                                completion,
-                                trace,
-                            )
-                        )
-                        gate = (
-                            first_token_event,
-                            generation_started_event,
-                            completion,
-                            trace,
-                        )
-                        if cross_microbatch_enabled:
-                            await release_cross_slot_with_gate(gate)
-                        if batch_kind == "cold":
-                            seen_documents.update(
-                                record["retrieval_idxs"]
-                                for record in generation_records
-                                if record["document_heat"] > 1.0
-                            )
-                self._cache_aware_prefill_batching_stats = batching_stats
-
-        async def enqueue_cache_aware_batch():
-            retrieval_cursor = 0
-            while retrieval_cursor < total_n:
-                batch_indices = list(
-                    range(
-                        retrieval_cursor,
-                        min(retrieval_cursor + R, total_n),
-                    )
-                )
-                batch_queries = [queries[i] for i in batch_indices]
-                retrieval_trace = {"retrieval_start_s": time.perf_counter()}
-                raw_results, raw_scores, raw_idxs = await self._retrieve_async(
-                    batch_queries
-                )
-                retrieval_trace["retrieval_end_s"] = time.perf_counter()
-                retrieval_results, retrieval_scores, retrieval_idxs = (
-                    self._reorder_retrieval_batch(raw_results, raw_scores, raw_idxs)
-                )
-
-                records = []
-                for bi, q_idx in enumerate(batch_indices):
-                    all_retrieval_results[q_idx] = retrieval_results[bi]
-                    all_retrieval_scores[q_idx] = retrieval_scores[bi]
-                    all_retrieval_idxs[q_idx] = retrieval_idxs[bi]
-                    prompt, document_heat_spans = self._build_prompt_with_document_heat(
-                        question=queries[q_idx],
-                        docs=retrieval_results[bi],
-                        retrieval_idxs=retrieval_idxs[bi],
-                        original_retrieval_result=raw_results[bi],
-                    )
-                    all_prompts[q_idx] = prompt
-                    records.append(
-                        {
-                            "request_index": q_idx,
-                            "prompt": prompt,
-                            "document_heat_spans": document_heat_spans,
-                            "retrieval_idxs": tuple(retrieval_idxs[bi]),
-                            "retrieval_start_s": retrieval_trace[
-                                "retrieval_start_s"
-                            ],
-                            "retrieval_end_s": retrieval_trace["retrieval_end_s"],
-                            "prompt_ready_s": time.perf_counter(),
-                        }
-                    )
-
-                # Dispatch this chunk before retrieving the next one, so its
-                # generation can overlap the following retrieval chunk.
-                await enqueue_cache_aware_records(records)
-                retrieval_cursor += R
-
         idx = 0
         previous_gate = None
         try:
             if cross_microbatch_enabled:
                 await acquire_cross_slot(wait_for_retrieval=True)
-            if cache_aware_prefill_batching:
-                await enqueue_cache_aware_batch()
-                idx = total_n
-
             while idx < total_n:
                 if previous_gate is not None:
                     await wait_for_retrieval_window(*previous_gate)
@@ -1644,17 +1206,16 @@ class AsyncPipeline(BasicPipeline):
                     completion.cancel()
             raise
 
-        update_adaptive_estimates()
         self.last_async_scheduler_trace = scheduler_trace
         self.last_async_scheduler_stats = self.summarize_scheduler_trace(
-            scheduler_trace, policy, adaptive_state
+            scheduler_trace, policy
         )
         self.last_async_scheduler_stats.update(
             {
-                "configured_async_retrieval_policy": configured_policy,
+                "configured_async_retrieval_policy": policy,
                 "effective_async_retrieval_policy": policy,
-                "direct_vllm_dispatch": direct_vllm_dispatch,
-                "application_generation_gate": not direct_vllm_dispatch,
+                "direct_vllm_dispatch": False,
+                "application_generation_gate": True,
                 "generation_queue_capacity_batches": generation_queue_capacity,
                 "generation_queue_high_water_batches": generation_queue_high_water,
             }
@@ -1691,7 +1252,7 @@ class AsyncPipeline(BasicPipeline):
         queries = dataset.question
         total_n = len(queries)
         R = self.config["retrieval_batch_size"]
-        max_iter = int(self._config_or("irg_max_iter", 2))
+        max_iter = int(self._config_or("irg_max_iter", 3))
         min_iter = int(self._config_or("irg_min_iter", 1))
         early_stop = bool(self._config_or("irg_early_stop", False))
         if max_iter < 1:
@@ -1700,6 +1261,7 @@ class AsyncPipeline(BasicPipeline):
             raise ValueError("irg_min_iter must be in [1, irg_max_iter]")
 
         states = [IRGState(q) for q in queries]
+        generation_tasks = []
         active = set(range(total_n))
         final_dispatch_times = [None] * total_n
         final_completion_times = [None] * total_n
@@ -1710,285 +1272,292 @@ class AsyncPipeline(BasicPipeline):
             raise ValueError("async_generation_queue_batches must be positive")
         generation_queue_high_water = 0
         async_trace = []
-        cross_microbatch_enabled = bool(
-            self._config_or("async_cross_microbatch_pipeline", True)
-        ) and total_n <= R
+        cross_microbatch_enabled = (
+            bool(self._config_or("async_cross_microbatch_pipeline", True))
+            and total_n <= R
+        )
         cross_lock_held = False
 
-        async def wait_for_prefill_or_completion(prefill_event, generation_task):
-            prefill_ready = asyncio.create_task(prefill_event.wait())
-            done, _ = await asyncio.wait(
-                {prefill_ready, generation_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if generation_task in done:
-                generation_task.result()
-            if not prefill_ready.done():
-                prefill_ready.cancel()
-                await asyncio.gather(prefill_ready, return_exceptions=True)
+        try:
+            if cross_microbatch_enabled:
+                await self._acquire_prefill_batch_cross_slot()
+                cross_lock_held = True
 
-        if cross_microbatch_enabled:
-            await self._acquire_prefill_batch_cross_slot()
-            cross_lock_held = True
-
-        for irg_round in range(max_iter):
-            if not active:
-                break
-            round_tasks = []
-            previous_prefill_gate = None
-            for offset in range(0, len(active), R):
-                if previous_prefill_gate is not None:
-                    await wait_for_prefill_or_completion(*previous_prefill_gate)
-                batch_indices = sorted(active)[offset : offset + R]
-                batch_queries = [
-                    states[qi].question
-                    if not states[qi].generations
-                    else (
-                        f"{states[qi].question}\n\n"
-                        f"Current answer draft: {states[qi].generations[-1]}"
-                    )
-                    for qi in batch_indices
-                ]
-                trace = {
-                    "round": irg_round,
-                    "batch_id": len(async_trace),
-                    "batch_size": len(batch_indices),
-                    "retrieval_start_s": time.perf_counter(),
-                }
-                retrieval_started = trace["retrieval_start_s"]
-                raw_results, raw_scores, raw_idxs = await self._retrieve_async(
-                    batch_queries
-                )
-                trace["retrieval_end_s"] = time.perf_counter()
-                retrieval_time = trace["retrieval_end_s"] - retrieval_started
-                results, scores, idxs = self._reorder_retrieval_batch(
-                    raw_results, raw_scores, raw_idxs
-                )
-
-                prompts = []
-                document_heat_spans = []
-                for qi, retrieval_query, docs, doc_scores, doc_idxs in zip(
-                    batch_indices, batch_queries, results, scores, idxs
-                ):
-                    state = states[qi]
-                    state.retrieval_queries.append(str(retrieval_query))
-                    state.retrievals.append(docs)
-                    state.retrieval_scores.append(doc_scores)
-                    state.retrieval_idxs.append(doc_idxs)
-                    state.retrieval_times.append(retrieval_time)
-                    prompt, heat_spans = self._build_irg_prompt(
-                        state.question,
-                        docs,
-                        state.generations[-1] if state.generations else None,
-                        state.iter + 1,
-                        retrieval_idxs=doc_idxs,
-                        return_document_heat=True,
-                    )
-                    state.prompts.append(prompt)
-                    prompts.append(prompt)
-                    document_heat_spans.append(heat_spans)
-
-                async def run_generation(
-                    q_indices,
-                    batch_prompts,
-                    batch_document_heat_spans,
-                    prefill_event,
-                    generation_trace,
-                ):
-                    generation_dispatched = time.perf_counter()
-                    generation_trace["generation_dispatch_s"] = generation_dispatched
-                    generation_started = time.perf_counter()
-                    async def observe_prefill_start():
-                        await prefill_event.wait()
-                        generation_trace["generation_start_s"] = getattr(
-                            prefill_event,
-                            "mnemorag_set_time_s",
-                            time.perf_counter(),
+            for irg_round in range(max_iter):
+                if not active:
+                    break
+                round_tasks = []
+                previous_prefill_gate = None
+                for offset in range(0, len(active), R):
+                    if previous_prefill_gate is not None:
+                        await self._wait_for_prefill_or_completion(
+                            *previous_prefill_gate
                         )
-
-                    prefill_observer = asyncio.create_task(observe_prefill_start())
-                    try:
-                        outputs, completion_times = await self._generate_async_safe(
-                            batch_prompts,
-                            document_heat_spans=batch_document_heat_spans,
-                            max_tokens=self._workflow_max_tokens(
-                                "irg_round_max_tokens"
-                            ),
-                            prefill_start_event=prefill_event,
-                            prefill_start_after_all=True,
-                            return_completion_times=True,
+                    batch_indices = sorted(active)[offset : offset + R]
+                    batch_queries = [
+                        states[qi].question
+                        if not states[qi].generations
+                        else (
+                            f"{states[qi].question}\n\n"
+                            f"Current answer draft: {states[qi].generations[-1]}"
                         )
-                        if not prefill_event.is_set():
-                            prefill_event.mnemorag_set_time_s = time.perf_counter()
-                            prefill_event.set()
-                        await prefill_observer
-                    finally:
-                        if not prefill_observer.done():
-                            prefill_observer.cancel()
-                            await asyncio.gather(
-                                prefill_observer, return_exceptions=True
-                            )
-                    generation_time = time.perf_counter() - generation_started
-                    generation_trace["generation_end_s"] = time.perf_counter()
-                    return (
-                        list(zip(q_indices, outputs, completion_times)),
-                        generation_time,
-                        generation_dispatched,
+                        for qi in batch_indices
+                    ]
+                    trace = {
+                        "round": irg_round,
+                        "batch_id": len(async_trace),
+                        "batch_size": len(batch_indices),
+                        "retrieval_start_s": time.perf_counter(),
+                    }
+                    retrieval_started = trace["retrieval_start_s"]
+                    raw_results, raw_scores, raw_idxs = await self._retrieve_async(
+                        batch_queries
+                    )
+                    trace["retrieval_end_s"] = time.perf_counter()
+                    retrieval_time = trace["retrieval_end_s"] - retrieval_started
+                    results, scores, idxs = self._reorder_retrieval_batch(
+                        raw_results, raw_scores, raw_idxs
                     )
 
-                active_tasks = [task for task in round_tasks if not task.done()]
-                while len(active_tasks) >= generation_queue_capacity:
-                    done, _ = await asyncio.wait(
-                        active_tasks,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for task in done:
-                        task.result()
-                    active_tasks = [task for task in round_tasks if not task.done()]
-                prefill_event = asyncio.Event()
-                generation_task = asyncio.create_task(
-                    run_generation(
-                        batch_indices,
-                        prompts,
-                        document_heat_spans,
-                        prefill_event,
-                        trace,
-                    )
-                )
-                round_tasks.append(generation_task)
-                generation_queue_high_water = max(
-                    generation_queue_high_water,
-                    len(active_tasks) + 1,
-                )
-                previous_prefill_gate = (prefill_event, generation_task)
-                if cross_microbatch_enabled:
-                    trace["cross_batch_id"] = len(self._cross_microbatch_trace)
-                    self._cross_microbatch_trace.append(trace)
-                    if cross_lock_held:
-                        self._release_prefill_batch_cross_slot(
-                            prefill_event,
-                            generation_task,
-                        )
-                        cross_lock_held = False
-                async_trace.append(trace)
-
-            if not round_tasks:
-                raise RuntimeError(
-                    f"IRG round {irg_round + 1} produced no generation work"
-                )
-
-            generated = await asyncio.gather(*round_tasks)
-            next_active = set()
-            for (
-                batch_outputs,
-                generation_time,
-                generation_dispatched,
-            ) in generated:
-                for qi, output, completion_time in batch_outputs:
-                    state = states[qi]
-                    final_dispatch_times[qi] = float(generation_dispatched)
-                    final_completion_times[qi] = float(completion_time)
-                    previous_output = (
-                        state.generations[-1] if state.generations else None
-                    )
-                    previous_idxs = (
-                        state.retrieval_idxs[-2]
-                        if len(state.retrieval_idxs) > 1
-                        else None
-                    )
-                    state.generations.append(output)
-                    state.generation_times.append(generation_time)
-                    state.iter += 1
-
-                    stable_output = (
-                        previous_output is not None
-                        and " ".join(str(previous_output).split()).lower()
-                        == " ".join(str(output).split()).lower()
-                    )
-                    stable_retrieval = previous_idxs is not None and set(
-                        previous_idxs
-                    ) == set(state.retrieval_idxs[-1])
-                    if (
-                        early_stop
-                        and state.iter >= min_iter
-                        and stable_output
-                        and stable_retrieval
+                    prompts = []
+                    document_heat_spans = []
+                    for qi, retrieval_query, docs, doc_scores, doc_idxs in zip(
+                        batch_indices, batch_queries, results, scores, idxs
                     ):
-                        state.stop_reason = "stable_generation_and_retrieval"
-                    elif state.iter >= max_iter:
-                        state.stop_reason = "max_iter"
-                    else:
-                        next_active.add(qi)
+                        state = states[qi]
+                        state.retrieval_queries.append(str(retrieval_query))
+                        state.retrievals.append(docs)
+                        state.retrieval_scores.append(doc_scores)
+                        state.retrieval_idxs.append(doc_idxs)
+                        state.retrieval_times.append(retrieval_time)
+                        prompt, heat_spans = self._build_irg_prompt(
+                            state.question,
+                            docs,
+                            state.generations[-1] if state.generations else None,
+                            state.iter + 1,
+                            retrieval_idxs=doc_idxs,
+                            return_document_heat=True,
+                        )
+                        state.prompts.append(prompt)
+                        prompts.append(prompt)
+                        document_heat_spans.append(heat_spans)
 
-            print(
-                f"IRG iter {irg_round + 1}/{max_iter} completed "
-                f"for {len(active)} samples; continuing={len(next_active)}"
+                    async def run_generation(
+                        q_indices,
+                        batch_prompts,
+                        batch_document_heat_spans,
+                        prefill_event,
+                        generation_trace,
+                    ):
+                        generation_dispatched = time.perf_counter()
+                        generation_trace["generation_dispatch_s"] = (
+                            generation_dispatched
+                        )
+                        generation_started = time.perf_counter()
+
+                        async def observe_prefill_start():
+                            await prefill_event.wait()
+                            generation_trace["generation_start_s"] = getattr(
+                                prefill_event,
+                                "mnemorag_set_time_s",
+                                time.perf_counter(),
+                            )
+
+                        prefill_observer = asyncio.create_task(observe_prefill_start())
+                        try:
+                            outputs, completion_times = await self._generate_async_safe(
+                                batch_prompts,
+                                document_heat_spans=batch_document_heat_spans,
+                                max_tokens=self._workflow_max_tokens(
+                                    "irg_round_max_tokens"
+                                ),
+                                prefill_start_event=prefill_event,
+                                prefill_start_after_all=True,
+                                return_completion_times=True,
+                            )
+                            if not prefill_event.is_set():
+                                prefill_event.mnemorag_set_time_s = time.perf_counter()
+                                prefill_event.set()
+                            await prefill_observer
+                        finally:
+                            if not prefill_observer.done():
+                                prefill_observer.cancel()
+                                await asyncio.gather(
+                                    prefill_observer, return_exceptions=True
+                                )
+                        generation_time = time.perf_counter() - generation_started
+                        generation_trace["generation_end_s"] = time.perf_counter()
+                        return (
+                            list(zip(q_indices, outputs, completion_times)),
+                            generation_time,
+                            generation_dispatched,
+                        )
+
+                    active_tasks = [task for task in round_tasks if not task.done()]
+                    while len(active_tasks) >= generation_queue_capacity:
+                        done, _ = await asyncio.wait(
+                            active_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for task in done:
+                            task.result()
+                        active_tasks = [task for task in round_tasks if not task.done()]
+                    prefill_event = asyncio.Event()
+                    generation_task = asyncio.create_task(
+                        run_generation(
+                            batch_indices,
+                            prompts,
+                            document_heat_spans,
+                            prefill_event,
+                            trace,
+                        )
+                    )
+                    round_tasks.append(generation_task)
+                    generation_tasks.append(generation_task)
+                    generation_queue_high_water = max(
+                        generation_queue_high_water,
+                        len(active_tasks) + 1,
+                    )
+                    previous_prefill_gate = (prefill_event, generation_task)
+                    if cross_microbatch_enabled:
+                        trace["cross_batch_id"] = len(self._cross_microbatch_trace)
+                        self._cross_microbatch_trace.append(trace)
+                        if cross_lock_held:
+                            self._release_prefill_batch_cross_slot(
+                                prefill_event,
+                                generation_task,
+                            )
+                            cross_lock_held = False
+                    async_trace.append(trace)
+
+                if not round_tasks:
+                    raise RuntimeError(
+                        f"IRG round {irg_round + 1} produced no generation work"
+                    )
+
+                generated = await asyncio.gather(*round_tasks)
+                next_active = set()
+                for (
+                    batch_outputs,
+                    generation_time,
+                    generation_dispatched,
+                ) in generated:
+                    for qi, output, completion_time in batch_outputs:
+                        state = states[qi]
+                        final_dispatch_times[qi] = float(generation_dispatched)
+                        final_completion_times[qi] = float(completion_time)
+                        previous_output = (
+                            state.generations[-1] if state.generations else None
+                        )
+                        previous_idxs = (
+                            state.retrieval_idxs[-2]
+                            if len(state.retrieval_idxs) > 1
+                            else None
+                        )
+                        state.generations.append(output)
+                        state.generation_times.append(generation_time)
+                        state.iter += 1
+
+                        stable_output = (
+                            previous_output is not None
+                            and " ".join(str(previous_output).split()).lower()
+                            == " ".join(str(output).split()).lower()
+                        )
+                        stable_retrieval = previous_idxs is not None and set(
+                            previous_idxs
+                        ) == set(state.retrieval_idxs[-1])
+                        if (
+                            early_stop
+                            and state.iter >= min_iter
+                            and stable_output
+                            and stable_retrieval
+                        ):
+                            state.stop_reason = "stable_generation_and_retrieval"
+                        elif state.iter >= max_iter:
+                            state.stop_reason = "max_iter"
+                        else:
+                            next_active.add(qi)
+
+                print(
+                    f"IRG iter {irg_round + 1}/{max_iter} completed "
+                    f"for {len(active)} samples; continuing={len(next_active)}"
+                )
+                active = next_active
+
+            if any(not state.generations for state in states):
+                missing = sum(not state.generations for state in states)
+                raise RuntimeError(f"IRG left {missing} requests unfinished")
+
+            dataset.update_output("pred_trajectory", [s.generations for s in states])
+            dataset.update_output("pred", [s.generations[-1] for s in states])
+            dataset.update_output("prompt", [s.prompts[-1] for s in states])
+            dataset.update_output("prompt_trajectory", [s.prompts for s in states])
+            dataset.update_output(
+                "retrieval_result", [s.retrievals[-1] for s in states]
             )
-            active = next_active
-
-        if any(not state.generations for state in states):
-            missing = sum(not state.generations for state in states)
-            raise RuntimeError(f"IRG left {missing} requests unfinished")
-
-        dataset.update_output("pred_trajectory", [s.generations for s in states])
-        dataset.update_output("pred", [s.generations[-1] for s in states])
-        dataset.update_output("prompt", [s.prompts[-1] for s in states])
-        dataset.update_output("prompt_trajectory", [s.prompts for s in states])
-        dataset.update_output("retrieval_result", [s.retrievals[-1] for s in states])
-        dataset.update_output(
-            "retrieval_score", [s.retrieval_scores[-1] for s in states]
-        )
-        dataset.update_output("retrieval_idxs", [s.retrieval_idxs[-1] for s in states])
-        dataset.update_output(
-            "retrieval_result_trajectory", [s.retrievals for s in states]
-        )
-        dataset.update_output(
-            "retrieval_score_trajectory", [s.retrieval_scores for s in states]
-        )
-        dataset.update_output(
-            "retrieval_idxs_trajectory", [s.retrieval_idxs for s in states]
-        )
-        dataset.update_output(
-            "retrieval_query_trajectory", [s.retrieval_queries for s in states]
-        )
-        dataset.update_output("irg_iterations", [s.iter for s in states])
-        dataset.update_output("irg_stop_reason", [s.stop_reason for s in states])
-        dataset.update_output(
-            "generation_dispatch_monotonic_s",
-            final_dispatch_times,
-        )
-        dataset.update_output(
-            "generation_completion_monotonic_s",
-            final_completion_times,
-        )
-        dataset.update_output(
-            "irg_retrieval_time_trajectory_s",
-            [s.retrieval_times for s in states],
-        )
-        dataset.update_output(
-            "irg_generation_time_trajectory_s",
-            [s.generation_times for s in states],
-        )
-        dataset._async_scheduler_trace = async_trace
-        if cross_lock_held:
-            self._cross_microbatch_lock.release()
-            cross_lock_held = False
-        dataset._async_scheduler_stats = {
-            "policy": "prefill_batch",
-            "configured_async_retrieval_policy": "prefill_batch",
-            "effective_async_retrieval_policy": "prefill_batch",
-            "direct_vllm_dispatch": False,
-            "application_generation_gate": True,
-            "generation_queue_capacity_batches": generation_queue_capacity,
-            "generation_queue_high_water_batches": generation_queue_high_water,
-            "batches": len(async_trace),
-            "cross_microbatch_pipeline": cross_microbatch_enabled,
-        }
-        return self.evaluate(
-            dataset,
-            do_eval=do_eval,
-            pred_process_fun=pred_process_fun,
-        )
+            dataset.update_output(
+                "retrieval_score", [s.retrieval_scores[-1] for s in states]
+            )
+            dataset.update_output(
+                "retrieval_idxs", [s.retrieval_idxs[-1] for s in states]
+            )
+            dataset.update_output(
+                "retrieval_result_trajectory", [s.retrievals for s in states]
+            )
+            dataset.update_output(
+                "retrieval_score_trajectory", [s.retrieval_scores for s in states]
+            )
+            dataset.update_output(
+                "retrieval_idxs_trajectory", [s.retrieval_idxs for s in states]
+            )
+            dataset.update_output(
+                "retrieval_query_trajectory", [s.retrieval_queries for s in states]
+            )
+            dataset.update_output("irg_iterations", [s.iter for s in states])
+            dataset.update_output("irg_stop_reason", [s.stop_reason for s in states])
+            dataset.update_output(
+                "generation_dispatch_monotonic_s",
+                final_dispatch_times,
+            )
+            dataset.update_output(
+                "generation_completion_monotonic_s",
+                final_completion_times,
+            )
+            dataset.update_output(
+                "irg_retrieval_time_trajectory_s",
+                [s.retrieval_times for s in states],
+            )
+            dataset.update_output(
+                "irg_generation_time_trajectory_s",
+                [s.generation_times for s in states],
+            )
+            dataset._async_scheduler_trace = async_trace
+            if cross_lock_held:
+                self._cross_microbatch_lock.release()
+                cross_lock_held = False
+            dataset._async_scheduler_stats = {
+                "policy": "prefill_batch",
+                "configured_async_retrieval_policy": "prefill_batch",
+                "effective_async_retrieval_policy": "prefill_batch",
+                "direct_vllm_dispatch": False,
+                "application_generation_gate": True,
+                "generation_queue_capacity_batches": generation_queue_capacity,
+                "generation_queue_high_water_batches": generation_queue_high_water,
+                "batches": len(async_trace),
+                "cross_microbatch_pipeline": cross_microbatch_enabled,
+            }
+            return self.evaluate(
+                dataset,
+                do_eval=do_eval,
+                pred_process_fun=pred_process_fun,
+            )
+        finally:
+            if cross_lock_held:
+                self._cross_microbatch_lock.release()
+            for task in generation_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*generation_tasks, return_exceptions=True)
 
     async def run_stream_recomp(self, dataset, do_eval=True, pred_process_fun=None):
         """Pipeline retrieval with RECOMP generation across request chunks."""
@@ -2020,276 +1589,271 @@ class AsyncPipeline(BasicPipeline):
             raise ValueError("async_generation_queue_batches must be positive")
         generation_queue_high_water = 0
         previous_prefill_gate = None
-        cross_microbatch_enabled = bool(
-            self._config_or("async_cross_microbatch_pipeline", True)
-        ) and total_n <= retrieval_batch_size
+        cross_microbatch_enabled = (
+            bool(self._config_or("async_cross_microbatch_pipeline", True))
+            and total_n <= retrieval_batch_size
+        )
         cross_lock_held = False
 
-        async def wait_for_prefill_or_completion(prefill_event, generation_task):
-            prefill_ready = asyncio.create_task(prefill_event.wait())
-            done, _ = await asyncio.wait(
-                {prefill_ready, generation_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if generation_task in done:
-                generation_task.result()
-            if not prefill_ready.done():
-                prefill_ready.cancel()
-                await asyncio.gather(prefill_ready, return_exceptions=True)
-
-        if cross_microbatch_enabled:
-            await self._acquire_prefill_batch_cross_slot()
-            cross_lock_held = True
-
-        async def run_recomp_generation(
-            batch_indices,
-            batch_questions,
-            batch_retrieval_results,
-            batch_retrieval_idxs,
-            batch_compression_prompts,
-            batch_compression_heat_spans,
-            prefill_event,
-            trace,
-        ):
-            trace["compression_dispatch_s"] = time.perf_counter()
-            trace["generation_dispatch_s"] = trace["compression_dispatch_s"]
-            compression_started = time.perf_counter()
-            async def observe_prefill_start():
-                await prefill_event.wait()
-                trace["generation_start_s"] = getattr(
-                    prefill_event,
-                    "mnemorag_set_time_s",
-                    time.perf_counter(),
-                )
-
-            prefill_observer = asyncio.create_task(observe_prefill_start())
-            try:
-                compressed_docs = await self._generate_async_safe(
-                    batch_compression_prompts,
-                    document_heat_spans=batch_compression_heat_spans,
-                    max_tokens=self._workflow_max_tokens(
-                        "recomp_compression_max_tokens", 128
-                    ),
-                    prefill_start_event=prefill_event,
-                    prefill_start_after_all=True,
-                )
-                if not prefill_event.is_set():
-                    prefill_event.mnemorag_set_time_s = time.perf_counter()
-                    prefill_event.set()
-                await prefill_observer
-            finally:
-                if not prefill_observer.done():
-                    prefill_observer.cancel()
-                    await asyncio.gather(prefill_observer, return_exceptions=True)
-            compression_elapsed = time.perf_counter() - compression_started
-            trace["compression_end_s"] = time.perf_counter()
-
-            answer_prompt_records = [
-                self._build_recomp_answer_prompt(
-                    question,
-                    compressed_doc,
-                    retrieval_idxs=doc_idxs,
-                    return_document_heat=True,
-                )
-                for question, compressed_doc, doc_idxs in zip(
-                    batch_questions,
-                    compressed_docs,
-                    batch_retrieval_idxs,
-                )
-            ]
-            answer_prompts = [record[0] for record in answer_prompt_records]
-            answer_heat_spans = [record[1] for record in answer_prompt_records]
-            answer_dispatch = time.perf_counter()
-            trace["answer_dispatch_s"] = answer_dispatch
-            answer_started = time.perf_counter()
-            predictions, completion_times = await self._generate_async_safe(
-                answer_prompts,
-                document_heat_spans=answer_heat_spans,
-                max_tokens=self._workflow_max_tokens("recomp_answer_max_tokens"),
-                return_completion_times=True,
-            )
-            answer_elapsed = time.perf_counter() - answer_started
-            trace["answer_end_s"] = time.perf_counter()
-            trace["generation_end_s"] = trace["answer_end_s"]
-            return {
-                "indices": batch_indices,
-                "compressed_docs": compressed_docs,
-                "answer_prompts": answer_prompts,
-                "predictions": predictions,
-                "completion_times": completion_times,
-                "answer_dispatch": answer_dispatch,
-                "compression_elapsed": compression_elapsed,
-                "answer_elapsed": answer_elapsed,
-            }
-
-        for offset in range(0, total_n, retrieval_batch_size):
-            if previous_prefill_gate is not None:
-                await wait_for_prefill_or_completion(*previous_prefill_gate)
-            batch_indices = list(
-                range(offset, min(offset + retrieval_batch_size, total_n))
-            )
-            batch_questions = [questions[index] for index in batch_indices]
-            trace = {
-                "batch_id": len(async_trace),
-                "batch_size": len(batch_indices),
-                "retrieval_start_s": time.perf_counter(),
-            }
-            raw_results, raw_scores, raw_idxs = await self._retrieve_async(
-                batch_questions
-            )
-            trace["retrieval_end_s"] = time.perf_counter()
-            retrieval_elapsed = (
-                trace["retrieval_end_s"] - trace["retrieval_start_s"]
-            )
-            retrieval_results, retrieval_scores, retrieval_idxs = (
-                self._reorder_retrieval_batch(raw_results, raw_scores, raw_idxs)
-            )
-
-            compression_records = [
-                self._build_recomp_prompt(
-                    question,
-                    docs,
-                    retrieval_idxs=doc_idxs,
-                    return_document_heat=True,
-                )
-                for question, docs, doc_idxs in zip(
-                    batch_questions,
-                    retrieval_results,
-                    retrieval_idxs,
-                )
-            ]
-            compression_prompts = [record[0] for record in compression_records]
-            compression_heat_spans = [record[1] for record in compression_records]
-
-            for local_index, request_index in enumerate(batch_indices):
-                raw_results_all[request_index] = raw_results[local_index]
-                raw_idxs_all[request_index] = raw_idxs[local_index]
-                retrieval_results_all[request_index] = retrieval_results[local_index]
-                retrieval_scores_all[request_index] = retrieval_scores[local_index]
-                retrieval_idxs_all[request_index] = retrieval_idxs[local_index]
-                compression_prompts_all[request_index] = compression_prompts[
-                    local_index
-                ]
-                retrieval_times_all[request_index] = retrieval_elapsed
-
-            active_tasks = [task for task in generation_tasks if not task.done()]
-            while len(active_tasks) >= generation_queue_capacity:
-                done, _ = await asyncio.wait(
-                    active_tasks,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    task.result()
-                active_tasks = [
-                    task for task in generation_tasks if not task.done()
-                ]
-            prefill_event = asyncio.Event()
-            generation_task = asyncio.create_task(
-                run_recomp_generation(
-                    batch_indices,
-                    batch_questions,
-                    retrieval_results,
-                    retrieval_idxs,
-                    compression_prompts,
-                    compression_heat_spans,
-                    prefill_event,
-                    trace,
-                )
-            )
-            generation_tasks.append(generation_task)
-            generation_queue_high_water = max(
-                generation_queue_high_water,
-                len(active_tasks) + 1,
-            )
-            previous_prefill_gate = (prefill_event, generation_task)
-            if cross_microbatch_enabled:
-                trace["cross_batch_id"] = len(self._cross_microbatch_trace)
-                self._cross_microbatch_trace.append(trace)
-                if cross_lock_held:
-                    self._release_prefill_batch_cross_slot(
-                        prefill_event,
-                        generation_task,
-                    )
-                    cross_lock_held = False
-            async_trace.append(trace)
-
         try:
-            generated_batches = await asyncio.gather(*generation_tasks)
-        except BaseException:
+            if cross_microbatch_enabled:
+                await self._acquire_prefill_batch_cross_slot()
+                cross_lock_held = True
+
+            async def run_recomp_generation(
+                batch_indices,
+                batch_questions,
+                batch_retrieval_idxs,
+                batch_compression_prompts,
+                batch_compression_heat_spans,
+                prefill_event,
+                trace,
+            ):
+                trace["compression_dispatch_s"] = time.perf_counter()
+                trace["generation_dispatch_s"] = trace["compression_dispatch_s"]
+                compression_started = time.perf_counter()
+
+                async def observe_prefill_start():
+                    await prefill_event.wait()
+                    trace["generation_start_s"] = getattr(
+                        prefill_event,
+                        "mnemorag_set_time_s",
+                        time.perf_counter(),
+                    )
+
+                prefill_observer = asyncio.create_task(observe_prefill_start())
+                try:
+                    compressed_docs = await self._generate_async_safe(
+                        batch_compression_prompts,
+                        document_heat_spans=batch_compression_heat_spans,
+                        max_tokens=self._workflow_max_tokens(
+                            "recomp_compression_max_tokens", 128
+                        ),
+                        prefill_start_event=prefill_event,
+                        prefill_start_after_all=True,
+                    )
+                    if not prefill_event.is_set():
+                        prefill_event.mnemorag_set_time_s = time.perf_counter()
+                        prefill_event.set()
+                    await prefill_observer
+                finally:
+                    if not prefill_observer.done():
+                        prefill_observer.cancel()
+                        await asyncio.gather(prefill_observer, return_exceptions=True)
+                compression_elapsed = time.perf_counter() - compression_started
+                trace["compression_end_s"] = time.perf_counter()
+
+                answer_prompt_records = [
+                    self._build_recomp_answer_prompt(
+                        question,
+                        compressed_doc,
+                        retrieval_idxs=doc_idxs,
+                        return_document_heat=True,
+                    )
+                    for question, compressed_doc, doc_idxs in zip(
+                        batch_questions,
+                        compressed_docs,
+                        batch_retrieval_idxs,
+                    )
+                ]
+                answer_prompts = [record[0] for record in answer_prompt_records]
+                answer_heat_spans = [record[1] for record in answer_prompt_records]
+                answer_dispatch = time.perf_counter()
+                trace["answer_dispatch_s"] = answer_dispatch
+                answer_started = time.perf_counter()
+                predictions, completion_times = await self._generate_async_safe(
+                    answer_prompts,
+                    document_heat_spans=answer_heat_spans,
+                    max_tokens=self._workflow_max_tokens("recomp_answer_max_tokens"),
+                    return_completion_times=True,
+                )
+                answer_elapsed = time.perf_counter() - answer_started
+                trace["answer_end_s"] = time.perf_counter()
+                trace["generation_end_s"] = trace["answer_end_s"]
+                return {
+                    "indices": batch_indices,
+                    "compressed_docs": compressed_docs,
+                    "answer_prompts": answer_prompts,
+                    "predictions": predictions,
+                    "completion_times": completion_times,
+                    "answer_dispatch": answer_dispatch,
+                    "compression_elapsed": compression_elapsed,
+                    "answer_elapsed": answer_elapsed,
+                }
+
+            for offset in range(0, total_n, retrieval_batch_size):
+                if previous_prefill_gate is not None:
+                    await self._wait_for_prefill_or_completion(*previous_prefill_gate)
+                batch_indices = list(
+                    range(offset, min(offset + retrieval_batch_size, total_n))
+                )
+                batch_questions = [questions[index] for index in batch_indices]
+                trace = {
+                    "batch_id": len(async_trace),
+                    "batch_size": len(batch_indices),
+                    "retrieval_start_s": time.perf_counter(),
+                }
+                raw_results, raw_scores, raw_idxs = await self._retrieve_async(
+                    batch_questions
+                )
+                trace["retrieval_end_s"] = time.perf_counter()
+                retrieval_elapsed = (
+                    trace["retrieval_end_s"] - trace["retrieval_start_s"]
+                )
+                retrieval_results, retrieval_scores, retrieval_idxs = (
+                    self._reorder_retrieval_batch(raw_results, raw_scores, raw_idxs)
+                )
+
+                compression_records = [
+                    self._build_recomp_prompt(
+                        question,
+                        docs,
+                        retrieval_idxs=doc_idxs,
+                        return_document_heat=True,
+                    )
+                    for question, docs, doc_idxs in zip(
+                        batch_questions,
+                        retrieval_results,
+                        retrieval_idxs,
+                    )
+                ]
+                compression_prompts = [record[0] for record in compression_records]
+                compression_heat_spans = [record[1] for record in compression_records]
+
+                for local_index, request_index in enumerate(batch_indices):
+                    raw_results_all[request_index] = raw_results[local_index]
+                    raw_idxs_all[request_index] = raw_idxs[local_index]
+                    retrieval_results_all[request_index] = retrieval_results[
+                        local_index
+                    ]
+                    retrieval_scores_all[request_index] = retrieval_scores[local_index]
+                    retrieval_idxs_all[request_index] = retrieval_idxs[local_index]
+                    compression_prompts_all[request_index] = compression_prompts[
+                        local_index
+                    ]
+                    retrieval_times_all[request_index] = retrieval_elapsed
+
+                active_tasks = [task for task in generation_tasks if not task.done()]
+                while len(active_tasks) >= generation_queue_capacity:
+                    done, _ = await asyncio.wait(
+                        active_tasks,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in done:
+                        task.result()
+                    active_tasks = [
+                        task for task in generation_tasks if not task.done()
+                    ]
+                prefill_event = asyncio.Event()
+                generation_task = asyncio.create_task(
+                    run_recomp_generation(
+                        batch_indices,
+                        batch_questions,
+                        retrieval_idxs,
+                        compression_prompts,
+                        compression_heat_spans,
+                        prefill_event,
+                        trace,
+                    )
+                )
+                generation_tasks.append(generation_task)
+                generation_queue_high_water = max(
+                    generation_queue_high_water,
+                    len(active_tasks) + 1,
+                )
+                previous_prefill_gate = (prefill_event, generation_task)
+                if cross_microbatch_enabled:
+                    trace["cross_batch_id"] = len(self._cross_microbatch_trace)
+                    self._cross_microbatch_trace.append(trace)
+                    if cross_lock_held:
+                        self._release_prefill_batch_cross_slot(
+                            prefill_event,
+                            generation_task,
+                        )
+                        cross_lock_held = False
+                async_trace.append(trace)
+
+            try:
+                generated_batches = await asyncio.gather(*generation_tasks)
+            except BaseException:
+                for task in generation_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*generation_tasks, return_exceptions=True)
+                raise
+
+            for generated in generated_batches:
+                for local_index, request_index in enumerate(generated["indices"]):
+                    compressed_doc = generated["compressed_docs"][local_index]
+                    compressed_docs_all[request_index] = compressed_doc
+                    selected_augmentation_all[request_index] = str(
+                        compressed_doc
+                    ).strip() not in {"", "<NO_EVIDENCE>", "NO_EVIDENCE"}
+                    answer_prompts_all[request_index] = generated["answer_prompts"][
+                        local_index
+                    ]
+                    predictions_all[request_index] = generated["predictions"][
+                        local_index
+                    ]
+                    dispatch_times_all[request_index] = generated["answer_dispatch"]
+                    completion_times_all[request_index] = generated["completion_times"][
+                        local_index
+                    ]
+                    compression_times_all[request_index] = generated[
+                        "compression_elapsed"
+                    ]
+                    answer_times_all[request_index] = generated["answer_elapsed"]
+
+            self.last_recomp_async_trace = async_trace
+            if cross_lock_held:
+                self._cross_microbatch_lock.release()
+                cross_lock_held = False
+            dataset._recomp_async_trace = [dict(record) for record in async_trace]
+            dataset._async_scheduler_trace = [dict(record) for record in async_trace]
+            dataset._async_scheduler_stats = {
+                "policy": "prefill_batch",
+                "configured_async_retrieval_policy": "prefill_batch",
+                "effective_async_retrieval_policy": "prefill_batch",
+                "direct_vllm_dispatch": False,
+                "application_generation_gate": True,
+                "generation_queue_capacity_batches": generation_queue_capacity,
+                "generation_queue_high_water_batches": generation_queue_high_water,
+                "batches": len(async_trace),
+                "cross_microbatch_pipeline": cross_microbatch_enabled,
+            }
+            dataset.update_output("retrieval_result", retrieval_results_all)
+            dataset.update_output("retrieval_score", retrieval_scores_all)
+            dataset.update_output("retrieval_idxs", retrieval_idxs_all)
+            dataset.update_output("original_retrieval_result", raw_results_all)
+            dataset.update_output("original_retrieval_idxs", raw_idxs_all)
+            dataset.update_output("compression_prompt", compression_prompts_all)
+            dataset.update_output("compressed_doc", compressed_docs_all)
+            dataset.update_output(
+                "recomp_selected_augmentation", selected_augmentation_all
+            )
+            dataset.update_output("prompt", answer_prompts_all)
+            dataset.update_output("pred", predictions_all)
+            dataset.update_output("generation_dispatch_monotonic_s", dispatch_times_all)
+            dataset.update_output(
+                "generation_completion_monotonic_s", completion_times_all
+            )
+            dataset.update_output("recomp_retrieval_batch_time_s", retrieval_times_all)
+            dataset.update_output(
+                "recomp_compression_batch_time_s", compression_times_all
+            )
+            dataset.update_output("recomp_answer_batch_time_s", answer_times_all)
+            return self.evaluate(
+                dataset,
+                do_eval=do_eval,
+                pred_process_fun=pred_process_fun,
+            )
+        finally:
+            if cross_lock_held:
+                self._cross_microbatch_lock.release()
             for task in generation_tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*generation_tasks, return_exceptions=True)
-            raise
-
-        for generated in generated_batches:
-            for local_index, request_index in enumerate(generated["indices"]):
-                compressed_doc = generated["compressed_docs"][local_index]
-                compressed_docs_all[request_index] = compressed_doc
-                selected_augmentation_all[request_index] = (
-                    str(compressed_doc).strip()
-                    not in {"", "<NO_EVIDENCE>", "NO_EVIDENCE"}
-                )
-                answer_prompts_all[request_index] = generated["answer_prompts"][
-                    local_index
-                ]
-                predictions_all[request_index] = generated["predictions"][local_index]
-                dispatch_times_all[request_index] = generated["answer_dispatch"]
-                completion_times_all[request_index] = generated["completion_times"][
-                    local_index
-                ]
-                compression_times_all[request_index] = generated[
-                    "compression_elapsed"
-                ]
-                answer_times_all[request_index] = generated["answer_elapsed"]
-
-        self.last_recomp_async_trace = async_trace
-        if cross_lock_held:
-            self._cross_microbatch_lock.release()
-            cross_lock_held = False
-        dataset._recomp_async_trace = [dict(record) for record in async_trace]
-        dataset._async_scheduler_trace = [dict(record) for record in async_trace]
-        dataset._async_scheduler_stats = {
-            "policy": "prefill_batch",
-            "configured_async_retrieval_policy": "prefill_batch",
-            "effective_async_retrieval_policy": "prefill_batch",
-            "direct_vllm_dispatch": False,
-            "application_generation_gate": True,
-            "generation_queue_capacity_batches": generation_queue_capacity,
-            "generation_queue_high_water_batches": generation_queue_high_water,
-            "batches": len(async_trace),
-            "cross_microbatch_pipeline": cross_microbatch_enabled,
-        }
-        dataset.update_output("retrieval_result", retrieval_results_all)
-        dataset.update_output("retrieval_score", retrieval_scores_all)
-        dataset.update_output("retrieval_idxs", retrieval_idxs_all)
-        dataset.update_output("original_retrieval_result", raw_results_all)
-        dataset.update_output("original_retrieval_idxs", raw_idxs_all)
-        dataset.update_output("compression_prompt", compression_prompts_all)
-        dataset.update_output("compressed_doc", compressed_docs_all)
-        dataset.update_output(
-            "recomp_selected_augmentation", selected_augmentation_all
-        )
-        dataset.update_output("prompt", answer_prompts_all)
-        dataset.update_output("pred", predictions_all)
-        dataset.update_output(
-            "generation_dispatch_monotonic_s", dispatch_times_all
-        )
-        dataset.update_output(
-            "generation_completion_monotonic_s", completion_times_all
-        )
-        dataset.update_output(
-            "recomp_retrieval_batch_time_s", retrieval_times_all
-        )
-        dataset.update_output(
-            "recomp_compression_batch_time_s", compression_times_all
-        )
-        dataset.update_output("recomp_answer_batch_time_s", answer_times_all)
-        return self.evaluate(
-            dataset,
-            do_eval=do_eval,
-            pred_process_fun=pred_process_fun,
-        )
 
     async def run_stream_dc(self, dataset, do_eval=True, pred_process_fun=None):
         """Backward-compatible alias for the RECOMP workflow."""

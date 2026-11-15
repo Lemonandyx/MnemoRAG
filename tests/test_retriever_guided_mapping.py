@@ -132,21 +132,23 @@ class AllReuseQueryPool(FakeQueryPool):
 
 
 class FixedThresholdTest(unittest.TestCase):
-    def test_production_thresholds_ignore_unapproved_overrides(self):
-        config = {
-            "similarity_t_reuse": 0.90,
-            "similarity_t_guided": 0.60,
-        }
-        with patch.dict(
-            os.environ,
-            {
-                "MNEMORAG_T_REUSE": "0.91",
-                "MNEMORAG_T_GUIDED": "0.61",
-            },
-            clear=False,
-        ):
-            os.environ.pop("MNEMORAG_ALLOW_THRESHOLD_OVERRIDE", None)
-            self.assertEqual(_resolve_similarity_thresholds(config), (0.95, 0.85))
+    def test_thresholds_follow_explicit_dataset_configuration(self):
+        self.assertEqual(
+            _resolve_similarity_thresholds(
+                {
+                    "similarity_t_reuse": 0.94,
+                    "similarity_t_guided": 0.85,
+                }
+            ),
+            (0.94, 0.85),
+        )
+        with self.assertRaises(ValueError):
+            _resolve_similarity_thresholds(
+                {
+                    "similarity_t_reuse": 0.8,
+                    "similarity_t_guided": 0.9,
+                }
+            )
 
 
 class GuidedProbeMergeTest(unittest.TestCase):
@@ -248,22 +250,6 @@ class PartitionedTopKTest(unittest.TestCase):
 
 
 class GuidedClusterMappingTest(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls._old_threshold_override = os.environ.get(
-            "MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"
-        )
-        os.environ["MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"] = "1"
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls._old_threshold_override is None:
-            os.environ.pop("MNEMORAG_ALLOW_THRESHOLD_OVERRIDE", None)
-        else:
-            os.environ["MNEMORAG_ALLOW_THRESHOLD_OVERRIDE"] = (
-                cls._old_threshold_override
-            )
-
     def test_exact_query_fast_path_bypasses_encoder_and_faiss(self):
         retriever = object.__new__(DenseRetriever)
         retriever.topk = 1
@@ -371,54 +357,6 @@ class GuidedClusterMappingTest(unittest.TestCase):
         )
         self.assertEqual(profile["action_counts"]["exact"], 1)
         self.assertEqual(retriever.last_similarity_action_counts["exact"], 1)
-
-    def test_adaptive_reuse_first_skips_quantizer_after_all_hit_batch(self):
-        retriever = object.__new__(DenseRetriever)
-        retriever.topk = 1
-        retriever.batch_size = 8
-        retriever.encoder = FakeEncoder()
-        retriever.index = object()
-        retriever.corpus = object()
-        retriever.docid_to_cluster = {100: 200}
-        retriever._config = {
-            "similarity_t_reuse": 0.95,
-            "similarity_t_guided": 0.70,
-            "enable_similarity_aware": True,
-            "enable_preassigned_guidance": True,
-            "ivf_nprobe": 128,
-        }
-        query_pool = AllReuseQueryPool()
-        ivf_index = FakeIVFIndex()
-
-        with (
-            patch.dict(
-                os.environ,
-                {"MNEMORAG_ADAPTIVE_REUSE_FIRST_QUANTIZER": "1"},
-            ),
-            patch(
-                "mnemorag.retriever.retriever.faiss.extract_index_ivf",
-                return_value=ivf_index,
-            ),
-            patch(
-                "mnemorag.retriever.retriever.load_docs",
-                side_effect=lambda _corpus, ids: [f"doc-{doc_id}" for doc_id in ids],
-            ),
-        ):
-            first = retriever._batch_search(
-                ["repeat"], query_pool=query_pool, return_idx=True
-            )
-            second = retriever._batch_search(
-                ["repeat"], query_pool=query_pool, return_idx=True
-            )
-
-        retriever.close()
-        self.assertEqual(first[2], [[900]])
-        self.assertEqual(second[2], [[900]])
-        self.assertEqual(ivf_index.quantizer.calls, 1)
-        self.assertEqual(
-            retriever.retrieval_profile()["adaptive_reuse_first"],
-            {"batches": 1, "quantizer_skips": 1},
-        )
 
     def test_reuse_payload_is_trimmed_to_requested_topk(self):
         retriever = object.__new__(DenseRetriever)

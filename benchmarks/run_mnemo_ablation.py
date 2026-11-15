@@ -111,7 +111,6 @@ def apply_variant(command: list[str], variant: str) -> list[str]:
                 "--kv-policy-override",
                 "lru",
                 "--no-cross-microbatch-pipeline",
-                "--no-cache-aware-prefill-batching",
             ]
         )
     elif variant == "no_sar":
@@ -133,9 +132,7 @@ def apply_variant(command: list[str], variant: str) -> list[str]:
     elif variant == "no_async_pipeline":
         _set_option(command, "--components", "full_no_async")
         _set_option(command, "--async-retrieval-policy", "sequential")
-        command.extend(
-            ["--no-cross-microbatch-pipeline", "--no-cache-aware-prefill-batching"]
-        )
+        command.extend(["--no-cross-microbatch-pipeline"])
     return command
 
 
@@ -224,11 +221,7 @@ def main() -> None:
             repeat_dir,
             excluded_indices=excluded_indices,
         )
-        order = (
-            PAPER_VARIANTS
-            if repeat % 2 == 0
-            else tuple(reversed(PAPER_VARIANTS))
-        )
+        order = PAPER_VARIANTS if repeat % 2 == 0 else tuple(reversed(PAPER_VARIANTS))
         for position, variant in enumerate(order):
             variant_dir = repeat_dir / variant
             accepted = variant_dir / "accepted.json"

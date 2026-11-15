@@ -1,5 +1,10 @@
 import unittest
 
+import numpy as np
+import pytest
+
+from benchmarks.quality import exact_retrieval_recall, recall_at_k
+
 from benchmarks.experiment_validation import (
     expected_prompt_contract,
     verified_complete,
@@ -8,6 +13,68 @@ from benchmarks.experiment_validation import (
     verified_prompt_contract,
     verified_quality_contract,
 )
+
+
+def test_recall_counts_exact_neighbors_instead_of_answer_strings():
+    assert recall_at_k([[1, 2, 3], [1, 2, 3]], [[3, 2, 1], [4, 5, 3]], 3) == [
+        1.0,
+        1.0 / 3.0,
+    ]
+    with pytest.raises(ValueError, match="matching shapes"):
+        recall_at_k([[1, 2, 3]], [[1, 2, 3], [1, 2, 3]], 3)
+    with pytest.raises(ValueError, match="valid document"):
+        recall_at_k([[1, -1, 3]], [[1, 2, 3]], 3)
+
+
+def test_exact_reference_searches_all_lists_without_changing_runtime_budget():
+    faiss = pytest.importorskip("faiss")
+    rng = np.random.default_rng(7)
+    vectors = rng.normal(size=(256, 8)).astype(np.float32)
+    queries = rng.normal(size=(2, 8)).astype(np.float32)
+    index = faiss.IndexIVFFlat(faiss.IndexFlatIP(8), 8, 4, faiss.METRIC_INNER_PRODUCT)
+    index.train(vectors)
+    index.add(vectors)
+    index.nprobe = 1
+    reference = faiss.IndexFlatIP(8)
+    reference.add(vectors)
+    _, neighbors = reference.search(queries, 3)
+
+    class Encoder:
+        def encode(self, questions, **_):
+            assert questions == ["q0", "q1"]
+            return queries
+
+    assert exact_retrieval_recall(Encoder(), index, ["q0", "q1"], neighbors, 3) == [
+        1.0,
+        1.0,
+    ]
+    assert index.nprobe == 1
+
+
+def test_slo_boundary_uses_mean_latency_and_accepts_stopped_scan():
+    from benchmarks.slo_campaign import (
+        QPS_GRIDS,
+        SYSTEMS,
+        WORKFLOWS,
+        select_boundary_qps,
+    )
+
+    rows = [
+        {
+            "workflow": workflow,
+            "nprobe": 128,
+            "system": system,
+            "arrival_rate_rps": qps,
+            "request_latency_mean_s": 2.0 if position < 2 else 11.0,
+            "request_latency_p99_s": 30.0,
+        }
+        for workflow in WORKFLOWS
+        for system in SYSTEMS
+        for position, qps in enumerate(QPS_GRIDS[workflow][:3])
+    ]
+    selected = select_boundary_qps(rows, nprobes=(128,))
+    for workflow in WORKFLOWS:
+        assert selected[(workflow, 128)] == QPS_GRIDS[workflow][:3]
 
 
 class ExperimentValidationTest(unittest.TestCase):
@@ -91,9 +158,9 @@ class ExperimentValidationTest(unittest.TestCase):
                 "acc": 32,
             },
             "metric_contract": {
-                "version": 2,
+                "version": 3,
                 "retrieval": {
-                    "name": "answer_hit_recall_at_k",
+                    "name": "exact_neighbor_recall_at_k",
                     "k": 5,
                     "scope": "final_retrieval_round",
                     "denominator": "all_requests",
@@ -135,9 +202,9 @@ class ExperimentValidationTest(unittest.TestCase):
                 "acc": 32,
             },
             "metric_contract": {
-                "version": 2,
+                "version": 3,
                 "retrieval": {
-                    "name": "answer_hit_recall_at_k",
+                    "name": "exact_neighbor_recall_at_k",
                     "k": 5,
                     "scope": "final_retrieval_round",
                     "denominator": "all_requests",

@@ -122,8 +122,8 @@ def verified_quality_contract(summary: dict, topk: int) -> bool:
     expected_metrics = {f"retrieval_recall_top{int(topk)}", "f1", "acc"}
     num_requests = summary.get("num_requests")
     return bool(
-        contract.get("version") == 2
-        and retrieval.get("name") == "answer_hit_recall_at_k"
+        contract.get("version") == 3
+        and retrieval.get("name") == "exact_neighbor_recall_at_k"
         and retrieval.get("k") == int(topk)
         and retrieval.get("scope") == "final_retrieval_round"
         and retrieval.get("denominator") == "all_requests"

@@ -347,15 +347,10 @@ class DocumentPool:
         )
         self._dense_nonzero = 0
         self.doc_counter = Counter()
-        self.pair_counter = {}
-        pair_prior_path = os.environ.get("MNEMORAG_DOC_PAIR_HOTNESS_PRIOR_PATH", "")
         prior_path = os.environ.get("MNEMORAG_DOC_HOTNESS_PRIOR_PATH", "")
         self.freeze_prior = (
             bool(prior_path)
             and os.environ.get("MNEMORAG_DOC_HOTNESS_FREEZE_PRIOR", "0") == "1"
-        )
-        self.canonical_tie = (
-            os.environ.get("MNEMORAG_HOTNESS_CANONICAL_TIE", "0") == "1"
         )
         if prior_path:
             with open(prior_path, "r", encoding="utf-8") as handle:
@@ -375,29 +370,6 @@ class DocumentPool:
                 f"Loaded document hotness prior: "
                 f"{self.total_docs()} docs from {prior_path}"
             )
-        if pair_prior_path:
-            with open(pair_prior_path, "r", encoding="utf-8") as handle:
-                raw_pairs = json.load(handle)
-
-            def convert(value):
-                return int(value) if str(value).isdigit() else value
-
-            self.pair_counter = {
-                convert(doc_id): {
-                    convert(other_id): int(count)
-                    for other_id, count in neighbors.items()
-                }
-                for doc_id, neighbors in raw_pairs.items()
-            }
-            print(
-                f"Loaded document pair-hotness prior: "
-                f"{len(self.pair_counter)} docs from {pair_prior_path}"
-            )
-        print(
-            f"document hotness freeze_prior={self.freeze_prior}, "
-            f"canonical_tie={self.canonical_tie}, "
-            f"dense_count_bytes={self.dense_count_bytes}"
-        )
         self.lock = Lock()
 
     @property
@@ -474,35 +446,6 @@ class DocumentPool:
     def total_docs(self):
         return self._dense_nonzero + len(self.doc_counter)
 
-    def _order_equal_heat_ties(self, pairs):
-        groups = {}
-        for pair in pairs:
-            groups.setdefault(self.get_count(pair[0]), []).append(pair)
-        ordered = []
-        for heat in sorted(groups, reverse=True):
-            group = groups[heat]
-            while group:
-                if ordered:
-                    previous = ordered[-1][0]
-
-                    def score(pair):
-                        return self.pair_counter.get(previous, {}).get(pair[0], 0)
-                else:
-
-                    def score(pair):
-                        return max(
-                            (
-                                self.pair_counter.get(pair[0], {}).get(candidate[0], 0)
-                                for candidate in pairs
-                                if candidate[0] != pair[0]
-                            ),
-                            default=0,
-                        )
-
-                group.sort(key=lambda pair: (-score(pair), str(pair[0])))
-                ordered.append(group.pop(0))
-        return ordered
-
     def reorder_by_hotness(self, doc_idxs, doc_contents):
         """Order documents by access heat while preserving cold-start order."""
         if not self.enable_hotness:
@@ -515,13 +458,7 @@ class DocumentPool:
 
         pairs = list(zip(doc_idxs, doc_contents))
 
-        if self.canonical_tie:
-            if self.pair_counter:
-                pairs = self._order_equal_heat_ties(pairs)
-            else:
-                pairs.sort(key=lambda x: (-self.get_count(x[0]), str(x[0])))
-        else:
-            pairs.sort(key=lambda x: self.get_count(x[0]), reverse=True)
+        pairs.sort(key=lambda pair: self.get_count(pair[0]), reverse=True)
 
         reordered_idxs, reordered_contents = zip(*pairs)
         return list(reordered_contents), list(reordered_idxs)

@@ -42,7 +42,6 @@ class Encoder:
         self.use_fp16 = use_fp16
         self.instruction = instruction
         self.silent = silent
-        self.gpu_num = torch.cuda.device_count()
         self.model, self.tokenizer = load_model(
             model_path=model_path, use_fp16=use_fp16
         )
@@ -66,34 +65,14 @@ class Encoder:
         )
         inputs = inputs.to(get_device(), non_blocking=True)
 
-        if "T5" in type(self.model).__name__ or (
-            isinstance(self.model, torch.nn.DataParallel)
-            and "T5" in type(self.model.module).__name__
-        ):
-            # T5-based retrieval model
-            decoder_input_ids = torch.zeros(
-                (inputs["input_ids"].shape[0], 1), dtype=torch.long
-            ).to(inputs["input_ids"].device)
-            output = self.model(
-                **inputs, decoder_input_ids=decoder_input_ids, return_dict=True
-            )
-            query_emb = output.last_hidden_state[:, 0, :]
-
-        else:
-            output = self.model(**inputs, return_dict=True)
-
-            pooler_output = output.get("pooler_output", None)
-            last_hidden_state = output.get("last_hidden_state", None)
-
-            query_emb = pooling(
-                pooler_output,
-                last_hidden_state,
-                inputs["attention_mask"],
-                self.pooling_method,
-            )
-
-        if "dpr" not in self.model_name:
-            query_emb = torch.nn.functional.normalize(query_emb, dim=-1)
+        output = self.model(**inputs, return_dict=True)
+        query_emb = pooling(
+            output.get("pooler_output"),
+            output.get("last_hidden_state"),
+            inputs["attention_mask"],
+            self.pooling_method,
+        )
+        query_emb = torch.nn.functional.normalize(query_emb, dim=-1)
         if return_torch:
             return query_emb.detach()
         query_emb = query_emb.detach().cpu().numpy()
@@ -124,12 +103,3 @@ class Encoder:
         if return_torch:
             return torch.cat(query_emb, dim=0)
         return np.concatenate(query_emb, axis=0)
-
-    @torch.inference_mode()
-    def multi_gpu_encode(
-        self, query_list: Union[List[str], str], batch_size=64, is_query=True
-    ) -> np.ndarray:
-        if self.gpu_num > 1:
-            self.model = torch.nn.DataParallel(self.model)
-        query_emb = self.encode(query_list, batch_size, is_query)
-        return query_emb

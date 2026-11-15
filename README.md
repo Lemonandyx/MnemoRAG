@@ -45,7 +45,7 @@ tables are intentionally excluded.
 | [`patches/vllm/`](patches/vllm/) | Sparse overlay for the tested vLLM 0.11.2 development tree |
 | [`paper/`](paper/) | Latest manuscript |
 | [`examples/`](examples/) | Minimal end-to-end integration test |
-| [`scripts/`](scripts/) | Index preparation, corpus preprocessing, and overlay utilities |
+| [`scripts/`](scripts/) | Index preparation and runtime patch utilities |
 | [`tests/`](tests/) | Unit, scheduler, campaign-contract, and cache/offload tests |
 
 ## Requirements

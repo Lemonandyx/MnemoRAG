@@ -9,6 +9,11 @@ stages, and final-output selection to the MnemoRAG evaluation contract.
 from __future__ import annotations
 
 import argparse
+
+try:
+    from .quality import exact_retrieval_recall
+except ImportError:
+    from quality import exact_retrieval_recall
 import collections
 import importlib
 import json
@@ -103,7 +108,6 @@ BASELINE_PROMPT_ORDERING_MODES = {
 DATASET_PATHS = {
     "nq": ASSET_ROOT / "qa/datasets/nq/train.jsonl",
     "hotpotqa": ASSET_ROOT / "qa/datasets/hotpotqa/train.jsonl",
-    "webquestions": ASSET_ROOT / "qa/datasets/web_questions/train.jsonl",
     "squad": ASSET_ROOT / "qa/datasets/squad/squad_dev.jsonl",
     "2wikimultihopqa": ASSET_ROOT / "qa/datasets/2wikimultihopqa/train.jsonl",
 }
@@ -215,7 +219,7 @@ def parse_args() -> argparse.Namespace:
             "retrieval cache."
         ),
     )
-    parser.add_argument("--irg-rounds", type=int, default=2)
+    parser.add_argument("--irg-rounds", type=int, default=3)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -472,26 +476,6 @@ def score_prediction(prediction: str, golden) -> dict[str, float]:
     return best
 
 
-def retrieval_recall_at_k(documents, golden, k: int) -> float:
-    """Match FlashRAG's answer-hit Retrieval_Recall metric."""
-    if k < 1:
-        raise ValueError("k must be positive")
-    normalized_answers = []
-    for answer in answers(golden):
-        normalized_answer = " ".join(normalize(answer))
-        if normalized_answer:
-            normalized_answers.append(normalized_answer)
-    for document in list(documents or ())[:k]:
-        if isinstance(document, dict):
-            contents = document.get("contents", "")
-        else:
-            contents = str(document)
-        normalized_document = " ".join(normalize(contents))
-        if any(answer in normalized_document for answer in normalized_answers):
-            return 1.0
-    return 0.0
-
-
 def collect_quality_observations(output_list, rows, topk: int, expected_count: int):
     """Require one complete Recall/F1/ACC observation per request."""
     if len(rows) != expected_count:
@@ -500,7 +484,6 @@ def collect_quality_observations(output_list, rows, topk: int, expected_count: i
             f"expected {expected_count} rows, observed {len(rows)}"
         )
     predictions = [None] * expected_count
-    retrieval_recalls = [None] * expected_count
     retrieval_id_rows = [None] * expected_count
     for request in output_list:
         request_id = int(request.id)
@@ -515,11 +498,6 @@ def collect_quality_observations(output_list, rows, topk: int, expected_count: i
             str(document.get("id", "")) if isinstance(document, dict) else ""
             for document in documents[:topk]
         ]
-        retrieval_recalls[request_id] = retrieval_recall_at_k(
-            documents,
-            rows[request_id].get("golden_answers", []),
-            topk,
-        )
 
     missing = [
         request_id
@@ -534,9 +512,8 @@ def collect_quality_observations(output_list, rows, topk: int, expected_count: i
         score_prediction(prediction, row.get("golden_answers", []))
         for prediction, row in zip(predictions, rows)
     ]
-    for request_id, (recall, metric) in enumerate(zip(retrieval_recalls, metrics)):
+    for request_id, metric in enumerate(metrics):
         for name, value in (
-            ("retrieval_recall", recall),
             ("f1", metric.get("f1")),
             ("acc", metric.get("acc")),
         ):
@@ -544,7 +521,7 @@ def collect_quality_observations(output_list, rows, topk: int, expected_count: i
                 raise RuntimeError(
                     f"Non-finite {name} for request {request_id}: {value}"
                 )
-    return predictions, retrieval_recalls, retrieval_id_rows, metrics
+    return predictions, retrieval_id_rows, metrics
 
 
 class CommonPromptBuilder:
@@ -673,6 +650,7 @@ def request_classes(retrieval_latencies_s: list[float]):
 
         def timed_rtask(self, *positional, **keywords):
             self._retrieval_started = time.perf_counter()
+            self.last_retrieval_query = keywords.get("input_str", self.initial_query)
             return self.get_rtasks(*positional, **keywords)
 
         def finish_retrieval(self):
@@ -1086,14 +1064,37 @@ def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         runtime_monitor.stop()
         runtime_monitor.assert_clean()
         runtime_resource_summary = runtime_monitor.summary()
-    predictions, retrieval_recalls, retrieval_id_rows, metrics = (
-        collect_quality_observations(
-            executor.output_list,
-            rows,
-            args.topk,
-            args.num_requests,
-        )
+    predictions, retrieval_id_rows, metrics = collect_quality_observations(
+        executor.output_list,
+        rows,
+        args.topk,
+        args.num_requests,
     )
+    # Quality reference work runs after the serving timer and resource monitor stop.
+    from mnemorag.retriever.encoder import Encoder
+
+    quality_encoder = Encoder(
+        model_name="e5",
+        model_path=str(ASSET_ROOT / "models/e5-large-v2"),
+        pooling_method="mean",
+        max_length=128,
+        use_fp16=True,
+        silent=True,
+    )
+    quality_index = faiss.read_index(
+        str(ASSET_ROOT / "qa/wiki18_2100w/indexes/e5_IVF4096,Flat.index")
+    )
+    final_queries = [None] * args.num_requests
+    for request in executor.output_list:
+        final_queries[int(request.id)] = request.last_retrieval_query
+    retrieval_recalls = exact_retrieval_recall(
+        quality_encoder,
+        quality_index,
+        final_queries,
+        retrieval_id_rows,
+        args.topk,
+    )
+    del quality_encoder, quality_index
     metric_summary = {
         name: statistics.fmean(item[name] for item in metrics) for name in ("f1", "acc")
     }
@@ -1290,9 +1291,9 @@ def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             ]
         ),
         "metric_contract": {
-            "version": 2,
+            "version": 3,
             "retrieval": {
-                "name": "answer_hit_recall_at_k",
+                "name": "exact_neighbor_recall_at_k",
                 "k": args.topk,
                 "scope": "final_retrieval_round",
                 "denominator": "all_requests",

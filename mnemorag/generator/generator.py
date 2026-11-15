@@ -251,30 +251,9 @@ class VLLMGenerator(BaseGenerator):
             max_num_batched_tokens = self.async_admission_max_prefill_tokens
             if max_num_batched_tokens > 0:
                 engine_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
-            if self.use_lora:
-                engine_kwargs.update(enable_lora=True, max_lora_rank=64)
             self.model = AsyncLLM.from_engine_args(AsyncEngineArgs(**engine_kwargs))
             self.async_request_counter = itertools.count()
             print("Persistent AsyncLLM engine enabled", flush=True)
-        elif self.use_lora:
-            from vllm import LLM
-
-            self.model = LLM(
-                self.model_path,
-                tensor_parallel_size=self.tensor_parallel_size,
-                gpu_memory_utilization=self.gpu_memory_utilization,
-                enable_lora=True,
-                max_lora_rank=64,
-                max_logprobs=32016,
-                max_model_len=self.max_model_len,
-                kv_cache_dtype=os.environ.get("VLLM_KV_CACHE_DTYPE", "auto"),
-                calculate_kv_scales=(
-                    os.environ.get("VLLM_CALCULATE_KV_SCALES", "0") == "1"
-                ),
-                enable_prefix_caching=self.enable_prefix_caching,
-                kv_transfer_config=kv_transfer_config,
-                max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "256")),
-            )
         else:
             from vllm import LLM
 
@@ -584,11 +563,6 @@ class VLLMGenerator(BaseGenerator):
             if first_token_event is not None and not use_native_first_token_event
             else RequestOutputKind.FINAL_ONLY
         )
-        lora_request = None
-        if self.use_lora:
-            from vllm.lora.request import LoRARequest
-
-            lora_request = LoRARequest("lora_module", 1, self.lora_path)
 
         remaining_first_tokens = len(input_list)
         first_token_lock = asyncio.Lock()
@@ -708,7 +682,7 @@ class VLLMGenerator(BaseGenerator):
                 if prefill_start_event is not None:
                     await mark_prefill_start(time.perf_counter())
 
-            generate_kwargs = {"lora_request": lora_request}
+            generate_kwargs = {}
             if request_first_token_event is not None:
                 generate_kwargs["first_token_event"] = request_first_token_event
             if request_prefill_start_event is not None:
@@ -799,19 +773,9 @@ class VLLMGenerator(BaseGenerator):
                 self.gpu_memory_utilization,
             )
         )
-        if self.gpu_num != 1 and self.gpu_num % 2 != 0:
-            self.tensor_parallel_size = self.gpu_num - 1
-        else:
-            self.tensor_parallel_size = self.gpu_num
-
-        self.lora_path = (
-            None
-            if "generator_lora_path" not in self._config
-            else self._config["generator_lora_path"]
-        )
-        self.use_lora = False
-        if self.lora_path is not None:
-            self.use_lora = True
+        if self.gpu_num < 1:
+            raise ValueError("LLM serving requires at least one visible GPU")
+        self.tensor_parallel_size = self.gpu_num
         self.max_model_len = self._config["generator_max_input_len"]
 
     def generate(
@@ -844,19 +808,5 @@ class VLLMGenerator(BaseGenerator):
             prepared_sampling_params if has_per_request_metadata else sampling_params
         )
 
-        if self.use_lora:
-            from vllm.lora.request import LoRARequest
-
-            outputs = self.model.generate(
-                prepared_inputs,
-                model_sampling_params,
-                lora_request=LoRARequest("lora_module", 1, self.lora_path),
-            )
-        else:
-            generate_outputs_time_st = time.time()
-            outputs = self.model.generate(prepared_inputs, model_sampling_params)
-            generate_outputs_time_ed = time.time()
-            print(
-                f"generate_outputs time: {generate_outputs_time_ed - generate_outputs_time_st:.4f} seconds"
-            )
+        outputs = self.model.generate(prepared_inputs, model_sampling_params)
         return self._format_outputs(outputs, return_raw_output, return_scores)

@@ -1,6 +1,6 @@
 import os
 
-from mnemorag.evaluator.metrics import BaseMetric
+from mnemorag.evaluator.metrics import ExactMatch, F1_Score, Sub_ExactMatch
 
 
 class Evaluator:
@@ -14,51 +14,25 @@ class Evaluator:
         self.save_data_flag = config["save_intermediate_data"]
         self.metrics = [metric.lower() for metric in self.config["metrics"]]
 
-        self.available_metrics = self._collect_metrics()
-
-        self.metric_class = {}
-        for metric in self.metrics:
-            if metric in self.available_metrics:
-                self.metric_class[metric] = self.available_metrics[metric](self.config)
-            else:
-                print(f"{metric} has not been implemented!")
-                raise NotImplementedError
-
-    def _collect_metrics(self):
-        """Collect all classes based on ```BaseMetric```."""
-
-        def find_descendants(base_class, subclasses=None):
-            if subclasses is None:
-                subclasses = set()
-
-            direct_subclasses = base_class.__subclasses__()
-            for subclass in direct_subclasses:
-                if subclass not in subclasses:
-                    subclasses.add(subclass)
-                    find_descendants(subclass, subclasses)
-            return subclasses
-
-        available_metrics = {}
-        for cls in find_descendants(BaseMetric):
-            metric_name = cls.metric_name
-            available_metrics[metric_name] = cls
-        return available_metrics
+        available = {"em": ExactMatch, "f1": F1_Score, "acc": Sub_ExactMatch}
+        unknown = set(self.metrics) - available.keys()
+        if unknown:
+            raise ValueError(f"Unsupported metrics: {sorted(unknown)}")
+        self.metric_class = {name: available[name](config) for name in self.metrics}
 
     def evaluate(self, data):
         """Calculate all metric indicators and summarize them."""
 
         result_dict = {}
         for metric in self.metrics:
-            try:
-                metric_result, metric_scores = self.metric_class[
-                    metric
-                ].calculate_metric(data)
-                result_dict.update(metric_result)
-                for metric_score, item in zip(metric_scores, data):
-                    item.update_evaluation_score(metric, metric_score)
-            except Exception as e:
-                print(f"Error in {metric}: {e}")
-                continue
+            metric_result, metric_scores = self.metric_class[metric].calculate_metric(
+                data
+            )
+            if len(metric_scores) != len(data):
+                raise ValueError(f"{metric}: expected one score per request")
+            result_dict.update(metric_result)
+            for metric_score, item in zip(metric_scores, data):
+                item.update_evaluation_score(metric, metric_score)
 
         if self.save_metric_flag:
             self.save_metric_score(result_dict)

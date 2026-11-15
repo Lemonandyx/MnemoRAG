@@ -159,8 +159,8 @@ def _require_metric_contract(summary: Mapping[str, Any]) -> None:
     topk = int(summary["topk"])
     contract = summary.get("metric_contract") or {}
     retrieval = contract.get("retrieval") or {}
-    if retrieval.get("name") != "answer_hit_recall_at_k":
-        raise ComparisonContractError("retrieval metric is not answer-hit Recall@k")
+    if retrieval.get("name") != "exact_neighbor_recall_at_k":
+        raise ComparisonContractError("retrieval metric is not exact-neighbor Recall@k")
     if int(retrieval.get("k", -1)) != topk:
         raise ComparisonContractError("retrieval metric k does not match topk")
     if contract.get("generation") != ["f1", "acc"]:
@@ -388,7 +388,6 @@ def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str
     workflow = str(summary.get("workflow") or "").lower()
     if workflow not in {"onepass", "irg", "recomp"}:
         raise ComparisonContractError(f"unsupported MnemoRAG workflow: {workflow}")
-    onepass = workflow == "onepass"
     required_equal = {
         "components": "full",
         "order_mode": "hotness_hint",
@@ -397,7 +396,6 @@ def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str
         "enable_hotness_sort": True,
         "enable_async_scheduling": True,
         "document_kv_heat": True,
-        "cache_aware_prefill_batching": onepass,
         "request_batching_policy": "worker_nonblocking_drain",
         "preformed_work_queue": False,
         "async_retrieval_policy": "prefill_batch",
@@ -417,9 +415,7 @@ def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str
     dataset = str(summary.get("dataset") or "").lower()
     expected_thresholds = EXPECTED_SIMILARITY_THRESHOLDS.get(dataset)
     if expected_thresholds is not None:
-        for field, expected in zip(
-            ("tau_reuse", "tau_guided"), expected_thresholds
-        ):
+        for field, expected in zip(("tau_reuse", "tau_guided"), expected_thresholds):
             if not math.isclose(
                 float(summary.get(field, float("nan"))),
                 expected,
@@ -589,12 +585,6 @@ def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str
                 "fallback": fallback_completion_count,
             },
         }
-    stage_scheduler = summary.get("batch_stage_scheduler") or {}
-    if onepass and stage_scheduler.get("application_generation_gate") is not False:
-        mismatches["batch_stage_scheduler.application_generation_gate"] = {
-            "expected": False,
-            "observed": stage_scheduler.get("application_generation_gate"),
-        }
     if mismatches:
         raise ComparisonContractError(
             "MnemoRAG full-optimization audit failed: "
@@ -605,15 +595,7 @@ def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str
         "workflow": workflow,
         "mechanisms": required_equal,
         "workflow_specific": {
-            "cache_aware_prefill_batching": (
-                "enabled" if onepass else "not_applicable"
-            ),
-            "cross_microbatch_pipeline": (
-                "superseded_by_vllm_continuous_batching"
-                if onepass
-                else "not_applicable"
-            ),
-            "direct_vllm_dispatch": "enabled",
+            "cross_microbatch_pipeline": "prefill_batch",
             "document_heat_cpu_kv": "enabled_and_exercised",
         },
         "cpu_kv_d2h_jobs": d2h_jobs,

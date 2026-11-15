@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import statistics
@@ -13,6 +12,16 @@ import time
 from pathlib import Path
 
 import numpy as np
+
+try:
+    from .fair_workload import file_sha256 as sha256
+except ImportError:
+    from fair_workload import file_sha256 as sha256
+
+try:
+    from .benchmark_point import resolve_paper_similarity_thresholds
+except ImportError:
+    from benchmark_point import resolve_paper_similarity_thresholds
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ASSET_ROOT = Path(
@@ -66,14 +75,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--has-threshold", type=float, default=0.6)
     parser.add_argument("--quality-reference-only", action="store_true")
     return parser.parse_args()
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def ensure_hedra_environment(args: argparse.Namespace) -> None:
@@ -143,7 +144,7 @@ def load_history(path: Path) -> dict[str, np.ndarray]:
         raise ValueError("Unsupported history snapshot")
     if history["embeddings"].ndim != 2 or history["embeddings"].shape[1] != 1024:
         raise ValueError(f"Expected Nx1024 history, got {history['embeddings'].shape}")
-    if not 2_000 <= history["embeddings"].shape[0] <= 2_048:
+    if history["embeddings"].shape[0] != 256:
         raise ValueError(f"Unexpected history size: {history['embeddings'].shape[0]}")
     if history["topk_doc_ids"].shape[1] < 3:
         raise ValueError("History snapshot does not contain top-k=3 results")
@@ -153,14 +154,15 @@ def load_history(path: Path) -> dict[str, np.ndarray]:
 def direct_args(args: argparse.Namespace, system: str) -> argparse.Namespace:
     return argparse.Namespace(
         system=system,
-        nprobe=args.nprobe,
+        nprobe=4096 if system == "faiss" else args.nprobe,
         topk=args.topk,
         gpu_id=args.gpu_id,
         cpu_threads=args.cpu_threads,
         retrieval_batch_size=args.max_batch_size,
         cache_capacity=80_000,
-        similarity_t_reuse=0.95,
-        similarity_t_guided=0.70,
+        similarity_t_reuse=resolve_paper_similarity_thresholds(args.dataset)[0],
+        similarity_t_guided=resolve_paper_similarity_thresholds(args.dataset)[1],
+        dataset=args.dataset,
         exact_query_cache=True,
         has_cache_capacity=2_048,
         proximity_tau=args.proximity_tau,
@@ -267,7 +269,10 @@ class GPTCacheRetrievalEngine:
 def initialize_standard_engine(
     args: argparse.Namespace, point_dir: Path, history: dict[str, np.ndarray]
 ):
-    import retrieval_cache_point as cache_point
+    try:
+        from . import retrieval_backends as cache_point
+    except ImportError:
+        import retrieval_backends as cache_point
 
     if args.system == "gptcache":
         engine = GPTCacheRetrievalEngine(args, point_dir)

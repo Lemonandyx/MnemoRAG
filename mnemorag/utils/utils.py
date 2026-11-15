@@ -28,17 +28,3 @@ def get_retriever(config):
     from mnemorag.retriever.retriever import DenseRetriever
 
     return DenseRetriever(config)
-
-
-def get_reranker(config):
-    """Construct an optional dense-retrieval reranker."""
-    from transformers import AutoConfig
-
-    from mnemorag.retriever.reranker import BiReranker, CrossReranker
-
-    architecture = AutoConfig.from_pretrained(
-        config["rerank_model_path"]
-    ).architectures[0]
-    if "forsequenceclassification" in architecture.lower():
-        return CrossReranker(config)
-    return BiReranker(config)

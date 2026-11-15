@@ -150,12 +150,6 @@ class Config:
         if config.get("index_path") is None:
             config["index_path"] = indexes.get(retrieval_method)
 
-        reranker_name = config.get("rerank_model_name")
-        if reranker_name and config.get("rerank_model_path") is None:
-            config["rerank_model_path"] = model_paths.get(reranker_name, reranker_name)
-        if reranker_name and config.get("rerank_pooling_method") is None:
-            config["rerank_pooling_method"] = self._pooling_for(reranker_name, pooling)
-
         generator_model = config["generator_model"]
         if config.get("generator_model_path") is None:
             config["generator_model_path"] = model_paths.get(

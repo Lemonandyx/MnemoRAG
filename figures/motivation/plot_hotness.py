@@ -21,14 +21,18 @@ def load_matrix(path: Path) -> tuple[np.ndarray, tuple[str, ...]]:
     if not rows:
         raise ValueError("the input table is empty")
     datasets = tuple(dict.fromkeys(row["dataset"] for row in rows))
+    if any(int(row["document_rank"]) < 1 for row in rows):
+        raise ValueError("document ranks must start at one")
     rank_count = max(int(row["document_rank"]) for row in rows)
     matrix = np.full((len(datasets), rank_count), np.nan, dtype=float)
     for row in rows:
         dataset_index = datasets.index(row["dataset"])
         rank_index = int(row["document_rank"]) - 1
+        if not np.isnan(matrix[dataset_index, rank_index]):
+            raise ValueError("duplicate dataset/document rank")
         matrix[dataset_index, rank_index] = float(row["normalized_hotness"])
-    if np.isnan(matrix).any():
-        raise ValueError("the input table does not contain a complete matrix")
+    if not np.isfinite(matrix).all() or np.any(matrix < 0) or np.any(matrix > 1):
+        raise ValueError("provide a complete matrix of normalized values in [0, 1]")
     return matrix, datasets
 
 
