@@ -100,10 +100,8 @@ python examples/test.py \
 
 ## Reproducing experiments
 
-The experiment scripts cover end-to-end serving across datasets and RAG
-workflows, retrieval comparisons, and component ablations. Configure the
-resource paths above, then use `--help` to view the workload and runtime
-options for each entry point.
+Use the following entry points for end-to-end evaluation, retrieval comparisons,
+and component ablations; `--help` lists the options.
 
 ```bash
 # Four datasets, three workflows, and increasing request rates
@@ -118,9 +116,8 @@ python -m benchmarks.run_mnemo_ablation --help
 
 ## Verification
 
-Check Python syntax and run the test suite in the environment with the patched
-vLLM installation. The tests cover retrieval reuse and guidance, document
-hotness, KV-cache eviction, CPU offload, and asynchronous request scheduling.
+Check syntax and test retrieval, caching, and asynchronous scheduling with
+the patched vLLM installation.
 
 ```bash
 python -m compileall -q mnemorag benchmarks figures patches/vllm
