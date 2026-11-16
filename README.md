@@ -4,16 +4,25 @@
 [![Python](https://img.shields.io/badge/Python-3.10--3.12-3776ab.svg)](pyproject.toml)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-MnemoRAG exploits correlations across requests to accelerate RAG serving.
+MnemoRAG is a RAG serving system that converts correlations across requests into
+lower retrieval, prefill, and scheduling overhead. It combines similarity-aware
+retrieval, hotness-driven prefix caching, and asynchronous RAG scheduling.
 
 **[Read the latest paper](paper/MnemoRAG.pdf)**
 
 ## Overview
 
+MnemoRAG integrates three complementary mechanisms:
+
 - **Similarity-aware retrieval** reuses historical search regions and
   adapts IVF probing to query similarity.
-- **Hotness-driven prefix caching** improves prefix reuse across requests.
-- **Asynchronous RAG scheduling** overlaps retrieval and generation.
+- **Hotness-driven prefix caching** orders retrieved documents by access
+  hotness, preserves relevance through a tail ordering hint, and manages GPU
+  and CPU KV blocks using hotness and recency.
+- **Asynchronous RAG scheduling** releases the next retrieval microbatch after
+  every request in the current microbatch is admitted to prefill, then overlaps
+  CPU search, GPU query matching, KV restoration, prefill, and decoding with
+  one bounded look-ahead microbatch.
 
 ## Repository layout
 
@@ -101,18 +110,6 @@ python -m benchmarks.run_retrieval_six_system_four_dataset --help
 # NQ at 8 QPS: Vanilla, w/o SAR, w/o Hotness, w/o Async, and Full
 python -m benchmarks.run_mnemo_ablation --help
 ```
-
-## Reproducing figures
-
-Pass experiment results to the plotting scripts:
-
-```bash
-python figures/end_to_end/plot.py --input /path/to/end_to_end.csv
-python figures/component_ablation/plot.py --input /path/to/component_ablation.csv
-```
-
-The scripts export PNG and PDF files. More examples are in
-[`figures/README.md`](figures/README.md).
 
 ## Verification
 
