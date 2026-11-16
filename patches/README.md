@@ -2,5 +2,5 @@
 
 | Component | Integration |
 |---|---|
-| [Faiss](faiss/README.md) | Standard 1.8.0 API; retrieval control is implemented in MnemoRAG |
-| [vLLM](vllm/) | Source overlay applied with `scripts/apply_vllm_patch.sh` |
+| [Faiss](faiss/README.md) | Faiss 1.8.0 |
+| [vLLM](vllm/) | Apply with [`scripts/apply_vllm_patch.sh`](../scripts/apply_vllm_patch.sh) |
