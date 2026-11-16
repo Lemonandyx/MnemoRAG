@@ -1,4 +1,4 @@
-"""Planning utilities for the reproducible 10-second SLO campaign."""
+"""Plan serving experiments around the 10-second SLO."""
 
 from __future__ import annotations
 

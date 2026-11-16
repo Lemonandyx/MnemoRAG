@@ -1,4 +1,4 @@
-"""Strict validation for fair MnemoRAG, FlashRAG, and HedraRAG groups."""
+"""Validation for cross-system experiment results."""
 
 from __future__ import annotations
 
@@ -215,7 +215,7 @@ def _require_prompt_contract(summary: Mapping[str, Any]) -> dict[str, Any]:
 def validate_standalone_point(
     summary: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Validate one point without asserting a matched cross-system sample."""
+    """Validate a single experiment result."""
     system = str(summary.get("system") or "unknown")
     if system not in REQUIRED_SYSTEMS:
         raise ComparisonContractError(f"unsupported system: {system}")
@@ -243,7 +243,7 @@ def validate_fair_comparison_group(
     *,
     required_systems: Sequence[str] = REQUIRED_SYSTEMS,
 ) -> dict[str, Any]:
-    """Validate one point containing one result from each compared system."""
+    """Validate a group of results from the compared systems."""
     required_systems = tuple(map(str, required_systems))
     if not required_systems:
         raise ComparisonContractError("required systems must not be empty")
@@ -382,7 +382,7 @@ def validate_fair_comparison_group(
 
 
 def validate_mnemorag_full_optimizations(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """Require every mechanism applicable to the selected workflow."""
+    """Check the mechanisms enabled for the selected workflow."""
     if summary.get("system") != "mnemorag":
         raise ComparisonContractError("full-optimization audit requires MnemoRAG")
     workflow = str(summary.get("workflow") or "").lower()

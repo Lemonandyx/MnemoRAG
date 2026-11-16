@@ -37,12 +37,9 @@ from vllm.v1.metrics.stats import (
 
 
 class RequestOutputCollector:
-    """
-    Collects streamed RequestOutputs per individual request,
-    for hand-off to the consuming asyncio generate task.
+    """Collect streaming outputs for one request.
 
-    When streaming deltas, RequestOutputs are merged if the
-    producer gets ahead of the consumer.
+    Merge deltas when the producer is ahead of the consumer.
     """
 
     def __init__(self, output_kind: RequestOutputKind):
@@ -58,8 +55,7 @@ class RequestOutputCollector:
         elif isinstance(self.output, RequestOutput) and isinstance(
             output, RequestOutput
         ):
-            # This ensures that request outputs with different request indexes
-            # (if n > 1) do not override each other.
+            # Keep outputs for different child-request indexes separate.
             self.output.add(output, aggregate=self.aggregate)
         elif isinstance(self.output, PoolingRequestOutput) and isinstance(
             output, PoolingRequestOutput
@@ -138,7 +134,6 @@ class RequestState:
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
-        # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
@@ -215,16 +210,12 @@ class RequestState:
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
         if not finished and final_only:
-            # Only the final output is required in FINAL_ONLY mode.
             return None
 
         if self.stream_interval > 1:
             assert self.detokenizer is not None
 
-            # Send output request only when
-            # 1. It has finished, or
-            # 2. It is the first token, or
-            # 3. It has reached the stream interval number of tokens
+            # Emit at completion, on the first token, or at the configured interval.
             if not (
                 finished
                 or self.sent_tokens_offset == 0
@@ -234,8 +225,7 @@ class RequestState:
                 return None
 
             if self.output_kind == RequestOutputKind.DELTA:
-                # Send tokens from the offset in DELTA mode, otherwise all
-                # tokens are sent.
+                # DELTA mode emits tokens since the previous output.
                 new_token_ids = self.detokenizer.output_token_ids[
                     self.sent_tokens_offset :
                 ]
@@ -283,12 +273,12 @@ class RequestState:
             )
         assert self.logprobs_processor is not None
         if self.output_kind == RequestOutputKind.DELTA:
-            # Side effect: logprobs processor forgets prompt logprobs
+            # Updating logprobs clears the stored prompt logprobs.
             prompt_logprobs = self.logprobs_processor.pop_prompt_logprobs()
         else:
             prompt_logprobs = self.logprobs_processor.prompt_logprobs
 
-        # If prompt embeds were used, put placeholder prompt token ids
+        # Use placeholder token IDs for prompt embeddings.
         prompt_token_ids = self.prompt_token_ids
         if prompt_token_ids is None and self.prompt_embeds is not None:
             prompt_token_ids = [0] * len(self.prompt_embeds)
@@ -316,12 +306,10 @@ class RequestState:
         finished = finish_reason is not None
         delta = self.output_kind == RequestOutputKind.DELTA
 
-        # Prepare text and token_ids, based on delta mode
         text = self.detokenizer.get_next_output_text(finished, delta)
         if not delta:
             token_ids = self.detokenizer.output_token_ids
 
-        # Prepare logprobs, based on delta mode
         logprobs = self.logprobs_processor.logprobs
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
@@ -389,12 +377,10 @@ class OutputProcessor:
             if req_state is not None:
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
-                # Produce final abort output.
                 if req_state.queue is not None and (
                     request_output := req_state.make_request_output(
                         new_token_ids=[],
-                        # Set pooling_output is not None to
-                        # correctly enter the abort pooling branch
+                        # Select the pooling abort branch with a non-None output.
                         pooling_output=torch.randn(0, device="cpu")
                         if req_state.detokenizer is None
                         else None,
@@ -449,26 +435,9 @@ class OutputProcessor:
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
-        """
-        Process the EngineCoreOutputs:
-        1) Compute stats for logging
-        2) Detokenize
-        3) Create and handle RequestOutput objects:
-            * If there is a queue (for usage with AsyncLLM),
-              put the RequestOutput objects into the queue for
-              handling by the per-request generate() tasks.
+        """Detokenize engine outputs, update statistics, and route request outputs.
 
-            * If there is no queue (for usage with LLMEngine),
-              return a list of RequestOutput objects.
-
-        NOTE FOR DEVELOPERS
-
-        vLLM V1 minimizes the number of python loops over the full
-        batch to ensure system overheads are minimized. This is the
-        only function that should loop over EngineCoreOutputs.
-
-        If you need to touch every element of the batch, do it from
-        within the loop below.
+        Return outputs for synchronous callers or enqueue them for AsyncLLM.
         """
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
@@ -477,14 +446,12 @@ class OutputProcessor:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
             if req_state is None:
-                # Ignore output for already-aborted request.
                 continue
             if self.mnemorag_prefill_start_events:
                 self._signal_mnemorag_prefill_start_event(engine_core_output)
             if self.mnemorag_first_token_events:
                 self._signal_mnemorag_first_token_event(engine_core_output)
 
-            # 1) Compute stats for this iteration.
             self._update_stats_from_output(
                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
             )
@@ -500,7 +467,6 @@ class OutputProcessor:
             if pooling_output is None:
                 assert req_state.detokenizer is not None
                 assert req_state.logprobs_processor is not None
-                # 2) Detokenize the token ids into text and perform stop checks.
                 stop_string = req_state.detokenizer.update(
                     new_token_ids, finish_reason == FinishReason.STOP
                 )
@@ -508,11 +474,8 @@ class OutputProcessor:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
 
-                # 3) Compute sample and prompt logprobs for request,
-                # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
 
-            # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
                 new_token_ids,
                 pooling_output,
@@ -521,27 +484,21 @@ class OutputProcessor:
                 kv_transfer_params,
             ):
                 if req_state.queue is not None:
-                    # AsyncLLM: put into queue for handling by generate().
                     req_state.queue.put(request_output)
                 else:
-                    # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
 
-            # Free completed requests.
             if finish_reason is not None:
                 self.request_states.pop(req_id)
-                # Remove parent request if applicable.
                 parent_req = req_state.parent_req
                 if parent_req and not parent_req.child_requests:
                     self.parent_requests.pop(parent_req.request_id, None)
                 if not self.request_states:
                     self._requests_drained.set()
                 if not engine_core_output.finished:
-                    # If req not finished in EngineCore, but Detokenizer
-                    # detected stop string, abort needed in EngineCore.
+                    # Propagate detokenizer stop-string completion back to EngineCore.
                     reqs_to_abort.append(req_id)
 
-                # Track per-request stats
                 self._update_stats_from_finished(
                     req_state, finish_reason, iteration_stats
                 )
@@ -569,12 +526,9 @@ class OutputProcessor:
     def _signal_mnemorag_prefill_start_event(
         self, engine_core_output: EngineCoreOutput
     ) -> None:
-        """Publish the EngineCore scheduler-admission timestamp.
+        """Publish scheduler admission after any asynchronous KV restore completes.
 
-        Unlike frontend request enqueue, the SCHEDULED event is emitted only
-        after any asynchronous CPU-KV restore has completed and the request is
-        admitted to a model-execution step. EngineCore events use the host's
-        monotonic clock, the same clock family used by ``time.perf_counter``.
+        The timestamp comes from the engine's SCHEDULED event.
         """
         scheduled_at = next(
             (
@@ -645,7 +599,6 @@ class OutputProcessor:
                 SpanAttributes.GEN_AI_LATENCY_TIME_IN_MODEL_INFERENCE, inference_time
             )
 
-            # meta
             span.set_attribute(SpanAttributes.GEN_AI_REQUEST_ID, req_state.request_id)
             if req_state.top_p:
                 span.set_attribute(SpanAttributes.GEN_AI_REQUEST_TOP_P, req_state.top_p)

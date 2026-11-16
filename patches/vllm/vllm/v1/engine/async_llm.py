@@ -70,27 +70,7 @@ class AsyncLLM(EngineClient):
         client_count: int = 1,
         client_index: int = 0,
     ) -> None:
-        """
-        Create an AsyncLLM.
-
-        Args:
-            vllm_config: global configuration.
-            executor_class: an Executor impl, e.g. MultiprocExecutor.
-            log_stats: Whether to log stats.
-            usage_context: Usage context of the LLM.
-            mm_registry: Multi-modal registry.
-            use_cached_outputs: Whether to use cached outputs.
-            log_requests: Whether to log requests.
-            start_engine_loop: Whether to start the engine loop.
-            stat_loggers: customized stat loggers for the engine.
-                If not provided, default stat loggers will be used.
-                PLEASE BE AWARE THAT STAT LOGGER IS NOT STABLE
-                IN V1, AND ITS BASE CLASS INTERFACE MIGHT CHANGE.
-
-        Returns:
-            None
-        """
-        # Ensure we can serialize custom transformer configs
+        """Create an asynchronous engine client and its output processor."""
         maybe_register_config_serialize_by_value()
 
         self.model_config = vllm_config.model_config
@@ -123,7 +103,6 @@ class AsyncLLM(EngineClient):
         self._mnemorag_first_token_events: dict[str, asyncio.Event] = {}
         self._mnemorag_prefill_start_events: dict[str, asyncio.Event] = {}
 
-        # OutputProcessor (converts EngineCoreOutputs --> RequestOutput).
         stream_interval = self.vllm_config.scheduler_config.stream_interval
         self.output_processor = OutputProcessor(
             self.tokenizer, log_stats=self.log_stats, stream_interval=stream_interval
@@ -139,7 +118,6 @@ class AsyncLLM(EngineClient):
             tracer = init_tracer("vllm.llm_engine", endpoint)
             self.output_processor.tracer = tracer
 
-        # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -149,7 +127,6 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
         )
 
-        # Loggers.
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
             self.logger_manager = StatLoggerManager(
@@ -162,7 +139,6 @@ class AsyncLLM(EngineClient):
             )
             self.logger_manager.log_engine_initialized()
 
-        # Pause / resume state for async RL workflows.
         self._pause_cond = asyncio.Condition()
         self._paused = False
 
@@ -218,7 +194,6 @@ class AsyncLLM(EngineClient):
         client_count: int = 1,
         client_index: int = 0,
     ) -> "AsyncLLM":
-        # Create the LLMEngine.
         return cls(
             vllm_config=vllm_config,
             executor_class=Executor.get_class(vllm_config),
@@ -241,13 +216,11 @@ class AsyncLLM(EngineClient):
         usage_context: UsageContext = UsageContext.ENGINE_CONTEXT,
         stat_loggers: list[StatLoggerFactory] | None = None,
     ) -> "AsyncLLM":
-        """Create an AsyncLLM from the EngineArgs."""
+        """Create an AsyncLLM from engine arguments."""
 
-        # Create the engine configs.
         vllm_config = engine_args.create_engine_config(usage_context)
         executor_class = Executor.get_class(vllm_config)
 
-        # Create the AsyncLLM.
         return cls(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -262,7 +235,7 @@ class AsyncLLM(EngineClient):
         self.shutdown()
 
     def shutdown(self):
-        """Shutdown, cleaning up the background proc and IPC."""
+        """Stop background processes and close IPC resources."""
 
         shutdown_prometheus()
 
@@ -294,17 +267,15 @@ class AsyncLLM(EngineClient):
         data_parallel_rank: int | None = None,
         prompt_text: str | None = None,
     ) -> RequestOutputCollector:
-        """Add new request to the AsyncLLM."""
+        """Add a request to the asynchronous engine."""
 
         if self.errored:
             raise EngineDeadError()
 
         is_pooling = isinstance(params, PoolingParams)
 
-        # Create a new output collector for the request.
         queue = RequestOutputCollector(output_kind=params.output_kind)
 
-        # Convert Input --> Request.
         if isinstance(prompt, EngineCoreRequest):
             request = prompt
         else:
@@ -339,7 +310,6 @@ class AsyncLLM(EngineClient):
         parent_params = params
         assert isinstance(parent_params, SamplingParams)
 
-        # Fan out child requests (for n>1).
         parent_request = ParentRequest(request_id, parent_params)
         for idx in range(parent_params.n):
             request_id, child_params = parent_request.get_child_info(idx)
@@ -359,20 +329,13 @@ class AsyncLLM(EngineClient):
         index: int,
         queue: RequestOutputCollector,
     ):
-        # Add the request to OutputProcessor (this process).
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
-        # Add the EngineCoreRequest to EngineCore (separate process).
         await self.engine_core.add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
 
-    # TODO: we should support multiple prompts in one call, as you
-    # can do with LLM.generate. So that for multi-prompt completion
-    # requests we don't need to send multiple messages to core proc,
-    # and so we don't need multiple streams which then get
-    # re-multiplexed in the API server anyhow.
     async def generate(
         self,
         prompt: EngineCoreRequest | PromptType,
@@ -388,20 +351,7 @@ class AsyncLLM(EngineClient):
         first_token_event: asyncio.Event | None = None,
         prefill_start_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[RequestOutput, None]:
-        """
-        Main function called by the API server to kick off a request
-            * 1) Making an AsyncStream corresponding to the Request.
-            * 2) Processing the Input.
-            * 3) Adding the Request to the Detokenizer.
-            * 4) Adding the Request to the EngineCore (separate process).
-
-        A separate output_handler loop runs in a background AsyncIO task,
-        pulling outputs from EngineCore and putting them into the
-        per-request AsyncStream.
-
-        The caller of generate() iterates the returned AsyncGenerator,
-        returning the RequestOutput back to the caller.
-        """
+        """Submit a generation request and stream its outputs."""
 
         if (
             self.vllm_config.cache_config.kv_sharing_fast_prefill
@@ -423,12 +373,9 @@ class AsyncLLM(EngineClient):
             self._mnemorag_prefill_start_events[request_id] = prefill_start_event
 
         try:
-            # We start the output_handler on the first call to generate() so
-            # we can call __init__ before the event loop, which enables us
-            # to handle startup failure gracefully in the OpenAI server.
+            # Start output handling lazily so construction can precede the event loop.
             self._run_output_handler()
 
-            # Wait until generation is resumed if the engine is paused.
             async with self._pause_cond:
                 await self._pause_cond.wait_for(lambda: not self._paused)
 
@@ -453,42 +400,33 @@ class AsyncLLM(EngineClient):
                 data_parallel_rank=data_parallel_rank,
                 prompt_text=prompt_text,
             )
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
+            # Read outputs delivered by the background handler.
             finished = False
             while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
+                # Drain queued outputs without yielding to the event loop.
                 out = q.get_nowait() or await q.get()
 
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
                 finished = out.finished
                 assert isinstance(out, RequestOutput)
                 yield out
 
-        # If the request is disconnected by the client, generate()
-        # is cancelled or the generator is garbage collected. So,
-        # we abort the request if we end up here.
+        # Abort if the caller disconnects or cancels the generator.
         except (asyncio.CancelledError, GeneratorExit):
             await self.abort(request_id)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
             raise
 
-        # Engine is dead. Do not abort since we shut down.
         except EngineDeadError:
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
-        # Request validation error.
         except ValueError:
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
 
-        # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             await self.abort(request_id)
             if self.log_requests:
@@ -504,8 +442,7 @@ class AsyncLLM(EngineClient):
         if self.output_handler is not None:
             return
 
-        # Ensure that the task doesn't have a circular ref back to the AsyncLLM
-        # object, or else it won't be garbage collected and cleaned up properly.
+        # Avoid a reference cycle so AsyncLLM can be collected and shut down.
         engine_core = self.engine_core
         output_processor = self.output_processor
         log_stats = self.log_stats
@@ -515,7 +452,6 @@ class AsyncLLM(EngineClient):
         async def output_handler():
             try:
                 while True:
-                    # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
 
@@ -523,9 +459,7 @@ class AsyncLLM(EngineClient):
                         IterationStats() if (log_stats and num_outputs) else None
                     )
 
-                    # Split outputs into chunks of at most
-                    # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
-                    # event loop for too long.
+                    # Chunk output processing to keep the event loop responsive.
                     if num_outputs <= envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE:
                         slices = (outputs.outputs,)
                     else:
@@ -535,27 +469,20 @@ class AsyncLLM(EngineClient):
                         )
 
                     for i, outputs_slice in enumerate(slices):
-                        # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
                             outputs_slice, outputs.timestamp, iteration_stats
                         )
-                        # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
 
-                        # Allow other asyncio tasks to run between chunks
                         if i + 1 < len(slices):
                             await asyncio.sleep(0)
 
-                        # 3) Abort any reqs that finished due to stop strings.
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort
                         )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
-                    # 4) Logging.
-                    # TODO(rob): make into a coroutine and launch it in
-                    # background thread once Prometheus overhead is non-trivial.
                     if logger_manager:
                         logger_manager.record(
                             engine_idx=outputs.engine_index,
@@ -587,18 +514,9 @@ class AsyncLLM(EngineClient):
         wait_for_inflight_requests: bool = False,
         clear_cache: bool = True,
     ) -> None:
-        """
-        Pause generation to allow model weight updates.
+        """Pause request admission, optionally draining requests and clearing caches.
 
-        New generation/encoding requests are blocked until resume.
-
-        Args:
-            wait_for_inflight_requests: When ``True`` waits for in-flight
-                requests to finish before pausing. When ``False`` (default),
-                immediately aborts any in-flight requests.
-            clear_cache: Whether to clear KV cache and prefix cache after
-                draining. Set to ``False`` to preserve cache for faster resume.
-                Default is ``True`` (clear caches).
+        If wait_for_inflight_requests is false, active requests are aborted.
         """
 
         async with self._pause_cond:
@@ -615,7 +533,6 @@ class AsyncLLM(EngineClient):
         if self.output_processor.has_unfinished_requests():
             await self.output_processor.wait_for_requests_to_drain()
 
-        # Clear cache
         if clear_cache:
             await self.reset_prefix_cache()
             await self.reset_mm_cache()
@@ -644,27 +561,12 @@ class AsyncLLM(EngineClient):
         truncate_prompt_tokens: int | None = None,
         tokenization_kwargs: dict[str, Any] | None = None,
     ) -> AsyncGenerator[PoolingRequestOutput, None]:
-        """
-        Main function called by the API server to kick off a request
-            * 1) Making an AsyncStream corresponding to the Request.
-            * 2) Processing the Input.
-            * 3) Adding the Request to the EngineCore (separate process).
-
-        A separate output_handler loop runs in a background AsyncIO task,
-        pulling outputs from EngineCore and putting them into the
-        per-request AsyncStream.
-
-        The caller of generate() iterates the returned AsyncGenerator,
-        returning the RequestOutput back to the caller.
-        """
+        """Submit an encoding request and stream its outputs."""
 
         try:
-            # We start the output_handler on the first call to generate() so
-            # we can call __init__ before the event loop, which enables us
-            # to handle startup failure gracefully in the OpenAI server.
+            # Start output handling lazily so construction can precede the event loop.
             self._run_output_handler()
 
-            # Respect pause state before accepting new requests.
             async with self._pause_cond:
                 await self._pause_cond.wait_for(lambda: not self._paused)
 
@@ -686,40 +588,30 @@ class AsyncLLM(EngineClient):
                 priority=priority,
             )
 
-            # The output_handler task pushes items into the queue.
-            # This task pulls from the queue and yields to caller.
             finished = False
             while not finished:
-                # Note: drain queue without await if possible (avoids
-                # task switching under load which helps performance).
                 out = q.get_nowait() or await q.get()
                 assert isinstance(out, PoolingRequestOutput)
-                # Note: both OutputProcessor and EngineCore handle their
-                # own request cleanup based on finished.
                 finished = out.finished
                 yield out
 
-        # If the request is disconnected by the client, generate()
-        # is cancelled. So, we abort the request if we end up here.
+        # Abort the request if the caller disconnects or cancels.
         except asyncio.CancelledError:
             await self.abort(request_id)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
             raise
 
-        # Engine is dead. Do not abort since we shut down.
         except EngineDeadError:
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
-        # Request validation error.
         except ValueError:
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
 
-        # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             await self.abort(request_id)
             if self.log_requests:
@@ -812,9 +704,7 @@ class AsyncLLM(EngineClient):
         args: tuple = (),
         kwargs: dict | None = None,
     ):
-        """
-        Perform a collective RPC call to the given path.
-        """
+        """Perform a collective RPC call."""
         return await self.engine_core.collective_rpc_async(
             method, timeout, args, kwargs
         )
@@ -838,14 +728,7 @@ class AsyncLLM(EngineClient):
     async def scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int = 300
     ):
-        """
-        Scale up or down the data parallel size by adding or removing
-        engine cores.
-        Args:
-            new_data_parallel_size: The new number of data parallel workers
-            drain_timeout:
-                Maximum time to wait for requests to drain (seconds)
-        """
+        """Change the data-parallel worker count after draining active requests."""
         old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
         if old_data_parallel_size == new_data_parallel_size:
             logger.info(
@@ -865,12 +748,8 @@ class AsyncLLM(EngineClient):
         await self.engine_core.scale_elastic_ep(new_data_parallel_size)
         self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
 
-        # recreate stat loggers
+        # Recreating stat loggers resets Prometheus metrics.
         if new_data_parallel_size > old_data_parallel_size and self.log_stats:
-            # TODO(rob): fix this after talking with Ray team.
-            # This resets all the prometheus metrics since we
-            # unregister during initialization. Need to understand
-            # the intended behavior here better.
             self.logger_manager = StatLoggerManager(
                 vllm_config=self.vllm_config,
                 engine_idxs=list(range(new_data_parallel_size)),
@@ -879,7 +758,6 @@ class AsyncLLM(EngineClient):
 
     @property
     def is_running(self) -> bool:
-        # Is None before the loop is started.
         return self.output_handler is None or not self.output_handler.done()
 
     @property

@@ -217,13 +217,7 @@ class AsyncPipeline(BasicPipeline):
         return loop, self._retrieval_batch_queue
 
     async def _retrieve_async(self, queries):
-        """Retrieve without waiting for future arrivals.
-
-        Concurrent workflow calls are combined only when they are already
-        queued in the current event-loop turn. One dispatcher owns the
-        stateful QueryPool transition, while each completed slice is released
-        immediately to its caller for vLLM admission.
-        """
+        """Coalesce ready requests and serialize Query Base updates."""
         loop, queue = self._ensure_retrieval_batcher()
         query_list = list(queries)
         if not query_list:
@@ -264,8 +258,7 @@ class AsyncPipeline(BasicPipeline):
     async def _drain_ready_retrievals(self):
         queue = self._retrieval_batch_queue
         max_queries = max(1, int(self.config["retrieval_batch_size"]))
-        # Yield one event-loop turn, not a timed window. This lets callers that
-        # are already runnable enqueue before the ready set is drained.
+        # Let runnable callers enqueue before draining the ready requests.
         await asyncio.sleep(0)
         while queue:
             calls = []
@@ -333,9 +326,7 @@ class AsyncPipeline(BasicPipeline):
         self._cross_microbatch_previous_gate = None
         self._cross_microbatch_previous_prefill_gate = None
         self._cross_microbatch_trace = []
-        # Workloads may be launched by separate asyncio.run() calls. Recreate
-        # the lock so it is never retained from an earlier event loop or a
-        # failed workload.
+        # Recreate the lock for workloads started in a new event loop.
         self._cross_microbatch_lock = asyncio.Lock()
 
     async def _wait_for_prefill_or_completion(self, prefill_event, generation_task):
@@ -589,8 +580,7 @@ class AsyncPipeline(BasicPipeline):
                 and len(result[1]) == len(prompts)
             ):
                 return result
-            # Compatibility for generator implementations that accept extra
-            # keyword arguments but do not expose per-request completion.
+            # Support generators without per-request completion callbacks.
             completed = time.perf_counter()
             return result, [completed] * len(prompts)
         if prefill_start_event is not None:
@@ -1048,7 +1038,7 @@ class AsyncPipeline(BasicPipeline):
                 generation_queue_high_water,
                 len(active_tasks) + 1,
             )
-            # Let the task enter the shared AsyncLLM admission limiter now.
+            # Submit to the shared AsyncLLM admission limiter.
             await asyncio.sleep(0)
 
         async def wait_until_event_or_completion(event, completion, label):

@@ -166,19 +166,12 @@ class BaseGenerator:
         raise NotImplementedError
 
     def generate(self, input_list: list) -> List[str]:
-        """Generate one response for each input prompt.
-
-        Args:
-            input_list: it contains input texts, each item represents a sample.
-
-        Returns:
-            list: contains generator's response of each input sample.
-        """
+        """Generate one response per prompt."""
         raise NotImplementedError
 
 
 class VLLMGenerator(BaseGenerator):
-    """Class for decoder-only generator, based on vllm."""
+    """Decoder-only generation using vLLM."""
 
     supports_document_heat_metadata = True
 
@@ -427,14 +420,13 @@ class VLLMGenerator(BaseGenerator):
     def _prepare_document_heat_request(
         self, prompt: str, document_heat_spans, sampling_params
     ):
-        """Tokenize once and attach document heat to exact token intervals."""
+        """Tokenize prompts and attach document heat to token spans."""
         if not document_heat_spans:
             return prompt, sampling_params
 
         encoded = self.tokenizer(
             prompt,
-            # Match vLLM's string-prompt tokenization exactly. Passing
-            # pretokenized IDs must not silently drop the model's BOS token.
+            # Include the model's BOS token when building pretokenized prompts.
             add_special_tokens=True,
             return_offsets_mapping=True,
         )
@@ -459,7 +451,7 @@ class VLLMGenerator(BaseGenerator):
         request_params = deepcopy(sampling_params)
         request_params.extra_args = dict(request_params.extra_args or {})
         request_params.extra_args["mnemorag_document_heat_spans"] = token_spans
-        # Reuse the exact IDs used for span construction inside vLLM.
+        # Pass the same token IDs used to locate document spans.
         return {"prompt_token_ids": token_ids}, request_params
 
     def _format_outputs(self, outputs, return_raw_output, return_scores):
@@ -676,9 +668,8 @@ class VLLMGenerator(BaseGenerator):
 
                 prefill_observer = asyncio.create_task(observe_prefill_start())
             else:
-                # Engines without a native admission event cannot expose a
-                # more precise request-admission boundary. The prefill-token
-                # permit is still held until a generated token is observed.
+                # Without a native admission event, hold the prefill-token permit
+                # until the first generated token.
                 if prefill_start_event is not None:
                     await mark_prefill_start(time.perf_counter())
 

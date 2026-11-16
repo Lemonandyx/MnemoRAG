@@ -82,7 +82,7 @@ if get_device() == "cpu":
 
 
 class BaseRetriever:
-    """Base object for all retrievers."""
+    """Base class for retrievers."""
 
     def __init__(self, config):
         self._config = config
@@ -118,15 +118,7 @@ class BaseRetriever:
         raise NotImplementedError
 
     def _search(self, query: str, num: int, return_score: bool) -> List[Dict[str, str]]:
-        r"""Retrieve topk relevant documents in corpus.
-
-        Return:
-            list: contains information related to the document, including:
-                contents: used for building index
-                title: (if provided)
-                text: (if provided)
-
-        """
+        """Return the top-k documents for a query."""
 
         raise NotImplementedError
 
@@ -141,7 +133,7 @@ class BaseRetriever:
 
 
 class DenseRetriever(BaseRetriever):
-    r"""Dense retriever based on pre-built faiss index."""
+    """Dense retrieval over a Faiss index."""
 
     def __init__(self, config: dict, corpus=None):
         super().__init__(config)
@@ -723,7 +715,6 @@ class DenseRetriever(BaseRetriever):
                     elif detect_pooling_method == "cls_token":
                         detect_pooling_method = "cls"
                     else:
-                        # raise warning: not implemented pooling method
                         warnings.warn(
                             f"Pooling method {detect_pooling_method} is not implemented.",
                             UserWarning,
@@ -764,7 +755,6 @@ class DenseRetriever(BaseRetriever):
         else:
             return results
 
-    # Batched IVF retrieval with one OpenMP thread per worker.
     def _batch_search(
         self,
         query: List[str],
@@ -803,7 +793,6 @@ class DenseRetriever(BaseRetriever):
             if debug_timing:
                 print(message)
 
-        # basic setup
         if isinstance(query, str):
             query = [query]
         if num is None:
@@ -868,8 +857,7 @@ class DenseRetriever(BaseRetriever):
                 and len(state.topk_doc_ids) >= num
                 and len(state.topk_scores) >= num
             ):
-                # Copy the compact arrays before processing misses because a
-                # capacity-limited insertion may replace their Query Base slot.
+                # Copy cached arrays before insertions can replace their Query Base slots.
                 exact_hits.append(
                     (
                         position,
@@ -984,8 +972,7 @@ class DenseRetriever(BaseRetriever):
                 request_actions[position] = miss_actions[offset]
             publish_request_timings(completion_s, service_s, request_actions)
 
-            # The recursive miss path records the logical batch. Fold the
-            # exact-hit work into that profile without double-counting it.
+            # Include exact hits without recounting misses from the recursive call.
             outer_lookup_s = phase_times.get("exact_lookup_s", 0.0)
             outer_delta_s = max(0.0, self.last_retrieval_elapsed - inner_elapsed)
             self._retrieval_phase_totals["exact_lookup_s"] += outer_lookup_s
@@ -1006,7 +993,6 @@ class DenseRetriever(BaseRetriever):
                 return results, scores
             return results
 
-        # thresholds & params
         T_REUSE, T_GUIDED = _resolve_similarity_thresholds(self._config)
 
         try:
@@ -1080,7 +1066,6 @@ class DenseRetriever(BaseRetriever):
             raise ValueError("MNEMORAG_FAISS_MAX_CODES must be nonnegative")
         self._guided_max_codes = guided_max_codes
 
-        # Encode (GPU)
         encode_time_st = time.perf_counter()
         encoded = self.encoder.encode(
             query,
@@ -1092,14 +1077,13 @@ class DenseRetriever(BaseRetriever):
             similarity_emb = encoded
             emb = encoded.detach().cpu().numpy().astype(np.float32, order="C")
         else:
-            # Compatibility with external/fake encoders that only expose NumPy.
+            # Support encoders that return NumPy arrays.
             emb = np.asarray(encoded, dtype=np.float32, order="C")
             similarity_emb = emb
         encode_time_ed = time.perf_counter()
         phase_times["encode_s"] = encode_time_ed - encode_time_st
         debug(f"Encoding time for {B} samples: {phase_times['encode_s']:.4f}s")
 
-        # IVF & quantizer
         (
             index_ivf,
             quantizer,
@@ -1108,7 +1092,6 @@ class DenseRetriever(BaseRetriever):
             search_executor,
         ) = self._get_ivf_runtime()
 
-        # Historical-query matching and coarse search run concurrently.
         def run_similarity():
             run_similarity_st_time = time.perf_counter()
             sim_scores, sim_idxs = None, None
@@ -1141,11 +1124,10 @@ class DenseRetriever(BaseRetriever):
             )
             return distances, results
 
-        # init outputs
         scores = [None] * B
         idxs = [None] * B
 
-        # Submit independent GPU and CPU preparation tasks.
+        # Run historical-query matching and coarse search concurrently.
         parallel_st = time.perf_counter()
 
         if (
@@ -1190,7 +1172,6 @@ class DenseRetriever(BaseRetriever):
                 f"Current similarity normalization range: "
                 f"[{SIM_LOW:.4f}, {SIM_HIGH:.4f}]"
             )
-        # Action decision
         actions = ["full"] * B
         request_completion_s = [None] * B
         request_search_service_s = [0.0] * B
@@ -1213,9 +1194,7 @@ class DenseRetriever(BaseRetriever):
                     or len(hist_state.topk_doc_ids) < num
                     or len(hist_state.topk_scores) < num
                 ):
-                    # A smaller historical top-k cannot satisfy a deeper
-                    # request. Full IVF preserves the requested result depth
-                    # without relying on an incomplete cached payload.
+                    # Use full IVF when the cached result has fewer documents than requested.
                     actions[i] = "full"
         decision_end = time.perf_counter()
         phase_times["decision_s"] = (
@@ -1248,7 +1227,6 @@ class DenseRetriever(BaseRetriever):
             ]
             query_pool.touch(used_slots)
 
-        # reuse
         if query_pool is not None and sim_idxs is not None:
             for i in range(B):
                 if actions[i] == "reuse":
@@ -1260,10 +1238,8 @@ class DenseRetriever(BaseRetriever):
                     request_completion_s[i] = reuse_finished - retrieval_start
                     request_search_service_s[i] = reuse_finished - reuse_started
 
-        # faiss needed indices
         faiss_indices = [i for i in range(B) if actions[i] != "reuse"]
         if not faiss_indices:
-            # build results from reused idxs
             flat_idxs = [d for sub in idxs if sub for d in sub]
             load_st = time.perf_counter()
             docs = load_docs(self.corpus, flat_idxs)
@@ -1283,7 +1259,6 @@ class DenseRetriever(BaseRetriever):
                 return results, scores
             return results
 
-        # IVF search (per-query parallel)
         def search_one(local_i, qi, single_query_partitions=1):
             request_search_started = time.perf_counter()
             xq = emb[qi : qi + 1]
@@ -1335,16 +1310,11 @@ class DenseRetriever(BaseRetriever):
             )
             hist_state = query_pool.query_states[sim_idxs[qi, 0].item()]
             hist_clusters = list(hist_state.topk_cluster_ids or ())
-            # self_I_all is encoded in original batch order. ``local_i`` is
-            # only the position among non-reused queries and diverges from
-            # ``qi`` whenever an earlier query takes the reuse path.
+            # Index coarse lists by qi, the original batch position.
             self_clusters = self_I_all[qi].tolist()
             self_cluster_distances = self_D_all[qi].tolist()
 
-            # Algorithm 1 defines P = C_pruned union H(v). Preserve the full
-            # query-specific budget and append only novel historical lists;
-            # counting history inside the budget can evict the query's nearest
-            # lists and silently reduce retrieval quality.
+            # Retain the query's probe budget and append distinct historical lists.
             query_probes = _merge_guided_probe_lists(
                 self_clusters[:nprobe],
                 (),
@@ -1439,9 +1409,7 @@ class DenseRetriever(BaseRetriever):
                 params.max_codes = guided_max_codes
                 distances, indices = index_ivf.search(xq, k=num, params=params)
             if np.any(indices[0] < 0):
-                # Restricted IVF lists may contain fewer than top-k vectors.
-                # Fall back only for the affected query so invalid Faiss labels
-                # can never be materialized as Python's negative indices.
+                # Retry incomplete results to avoid invalid Faiss labels.
                 distances, indices = index_ivf.search(xq, k=num)
                 guided_probe_metrics[qi]["incomplete_result_fallback"] = True
                 if np.any(indices[0] < 0):
@@ -1502,7 +1470,6 @@ class DenseRetriever(BaseRetriever):
             debug(f"FAISS batch-full fast path: {len(faiss_indices)} samples")
         debug(f"CPU IVF search time: {phase_times['ivf_search_s']:.4f}s")
 
-        # load docs
         flat_idxs = [d for sub in idxs if sub for d in sub]
         load_st = time.perf_counter()
         docs = load_docs(self.corpus, flat_idxs)
@@ -1511,7 +1478,6 @@ class DenseRetriever(BaseRetriever):
 
         results = [docs[i * num : (i + 1) * num] for i in range(B)]
 
-        # update query pool (batch)
         update_st = time.perf_counter()
         if query_pool is not None:
             batch_query_states = []

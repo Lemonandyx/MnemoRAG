@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Run one isolated MnemoRAG evaluation point on the 21M Wikipedia corpus.
+"""Run one MnemoRAG serving experiment.
 
-Each invocation creates exactly one retrieval stack and one AsyncLLM engine.
-Campaign drivers must launch a fresh process for every configuration so that
-the query pool and vLLM prefix cache never leak across experimental points.
+Run each configuration in a fresh process to reset retrieval and prefix caches.
 """
 
 from __future__ import annotations
@@ -33,8 +31,7 @@ import time
 from collections import Counter, deque
 from pathlib import Path
 
-# Resource preflight may initialize CUDA before vLLM creates its engine core.
-# Spawn prevents the child from inheriting an initialized CUDA runtime.
+# Spawn prevents vLLM workers from inheriting an initialized CUDA runtime.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "1")
 
@@ -112,14 +109,12 @@ PAPER_SIMILARITY_THRESHOLDS = {
 COMPONENTS = {
     "vanilla": (False, False, False, "lru"),
     "async_baseline": (False, False, True, "lru"),
-    # Full MnemoRAG cache/scheduling stack with exact Full-IVF retrieval.
-    # This mode isolates Prefix-KV effects from similarity-aware retrieval.
+    # Disable similarity-aware retrieval for the prefix-cache ablation.
     "kv_full": (False, True, True, "heat"),
     "sar": (True, False, False, "lru"),
     "hotness": (False, True, False, "heat"),
     "async": (False, False, True, "lru"),
     "sar_hotness": (True, True, False, "heat"),
-    # Isolation modes used only by the formal component ablation.
     "full_no_hotness": (True, False, True, "lru"),
     "full_no_async": (True, True, False, "heat"),
     "full": (True, True, True, "heat"),
@@ -129,7 +124,7 @@ COMPONENTS = {
 def validate_single_query_probe_parallelism_contract(
     system_label: str, retrieval_profile: dict | None
 ) -> dict:
-    """Keep MnemoRAG intra-query IVF parallelism out of FlashRAG."""
+    """Check intra-query IVF parallelism for the selected system."""
     if retrieval_profile is None:
         raise RuntimeError("retrieval profile is required for IVF audit")
     profile = retrieval_profile.get("single_query_probe_parallelism")
@@ -313,7 +308,7 @@ def release_loaded_input_page_cache(paths: list[Path]) -> dict[str, object]:
 
 
 def build_prompt_template(config, order_mode: str, prompt_template_cls):
-    """Build the canonical QA template and apply the ordering-hint policy."""
+    """Build the QA prompt with the configured ordering hint."""
     if order_mode not in {"original", "hotness", "hotness_hint"}:
         raise ValueError(f"Unsupported order mode: {order_mode}")
     prompt_template = prompt_template_cls(
@@ -360,7 +355,7 @@ def resolve_paper_similarity_thresholds(
     tau_reuse: float | None = None,
     tau_guided: float | None = None,
 ) -> tuple[float, float]:
-    """Resolve the per-dataset thresholds reported in the manuscript."""
+    """Return dataset-specific similarity thresholds."""
     default_reuse, default_guided = PAPER_SIMILARITY_THRESHOLDS.get(
         dataset, PAPER_SIMILARITY_THRESHOLDS["nq"]
     )
@@ -1254,9 +1249,7 @@ def configure_resources(args: argparse.Namespace) -> list[int]:
         os.environ["VLLM_CPU_KV_STAGING_MAX_BLOCKS"] = str(
             cpu_kv["staging_buffer_blocks"]
         )
-        # The connector implements async/sync/adaptive scheduling per step.
-        # Disable the legacy handler-wide synchronization override so it
-        # cannot silently turn adaptive or async runs into global sync runs.
+        # Remove the handler-wide override so transfer scheduling remains per-step.
         os.environ["VLLM_CPU_KV_SYNC_H2D"] = "0"
         print(
             "CPU KV offload enabled: "
@@ -1648,7 +1641,7 @@ def load_retrieval_replay_csv(
     expected_count: int,
     expected_topk: int,
 ) -> list[dict[str, object]]:
-    """Load the legacy query-checked replay format used by paired runs."""
+    """Load query-checked retrieval results for replay."""
     replay = []
     with path.open(newline="", encoding="utf-8") as stream:
         for expected_index, row in enumerate(csv.DictReader(stream)):
@@ -1927,9 +1920,7 @@ def package_versions() -> dict[str, str]:
 async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
     sys.path.insert(0, str(PROJECT_ROOT))
     sys.path.insert(0, str(PROJECT_ROOT / "examples/quick_start"))
-    # The repository contains partial vLLM patch sources, so relying on cwd
-    # can resolve ``vllm`` as an empty namespace package.  Pin the complete
-    # Resolve the complete MnemoRAG vLLM runtime before loading the large index.
+    # Resolve the installed vLLM package before loading the index.
     if not (MNEMORAG_VLLM_ROOT / "vllm/__init__.py").is_file():
         raise RuntimeError(f"MnemoRAG vLLM runtime is incomplete: {MNEMORAG_VLLM_ROOT}")
     sys.path.insert(0, str(MNEMORAG_VLLM_ROOT))

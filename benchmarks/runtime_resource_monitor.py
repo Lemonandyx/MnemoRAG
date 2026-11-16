@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continuously audit CPU affinity and target-GPU ownership."""
+"""Monitor CPU affinity and GPU ownership."""
 
 from __future__ import annotations
 

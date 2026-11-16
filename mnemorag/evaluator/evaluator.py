@@ -4,7 +4,7 @@ from mnemorag.evaluator.metrics import ExactMatch, F1_Score, Sub_ExactMatch
 
 
 class Evaluator:
-    """Evaluator is used to summarize the results of all metrics."""
+    """Evaluate predictions with the configured metrics."""
 
     def __init__(self, config):
         self.config = config
@@ -21,7 +21,7 @@ class Evaluator:
         self.metric_class = {name: available[name](config) for name in self.metrics}
 
     def evaluate(self, data):
-        """Calculate all metric indicators and summarize them."""
+        """Compute per-request scores and return aggregate metrics."""
 
         result_dict = {}
         for metric in self.metrics:
@@ -49,8 +49,7 @@ class Evaluator:
                 f.write(f"{k}: {v}\n")
 
     def save_data(self, data, file_name="intermediate_data.json"):
-        """Save the evaluated data, including the raw data and the score of each data
-        sample on each metric."""
+        """Save evaluated requests and their scores."""
 
         save_path = os.path.join(self.save_dir, file_name)
 

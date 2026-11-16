@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the fair, resumable MnemoRAG end-to-end comparison campaign."""
+"""Run the MnemoRAG end-to-end comparison."""
 
 from __future__ import annotations
 

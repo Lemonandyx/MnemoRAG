@@ -4,9 +4,7 @@ from mnemorag.evaluator.utils import normalize_answer
 
 
 class BaseMetric:
-    """`BaseMetric` serves as the base object of all metrics. Implemented metric should
-    inherit this class.
-    """
+    """Base class for evaluation metrics."""
 
     metric_name = "base"
 
@@ -15,17 +13,7 @@ class BaseMetric:
         self.dataset_name = config["dataset_name"]
 
     def calculate_metric(self, data):
-        """Get the total score of this metric and score for each sample.
-
-        Args:
-            data object: it contains basic information and generated information.
-
-        Returns:
-            (metric_score: dict, metric_score_list: list)
-            metric_score: such as ``{'em': 0.53}``.
-            metric_score_list: score for each sample.
-
-        """
+        """Return aggregate and per-request scores."""
         raise NotImplementedError
 
     def get_dataset_answer(self, data):
@@ -33,7 +21,7 @@ class BaseMetric:
 
 
 class F1_Score(BaseMetric):
-    """Token-level F1 score"""
+    """Token-level F1 score."""
 
     metric_name = "f1"
 
@@ -82,10 +70,7 @@ class F1_Score(BaseMetric):
 
 
 class ExactMatch(BaseMetric):
-    r"""Exact match measure whether the predicted answer is completely consistent
-    with the standard answer.
-
-    """
+    """Exact match against reference answers."""
 
     metric_name = "em"
 
@@ -115,7 +100,7 @@ class ExactMatch(BaseMetric):
 
 
 class Sub_ExactMatch(BaseMetric):
-    r"""Sub-Exact match measure whether the predicted answer contains the standard answer."""
+    """Check whether a prediction contains a reference answer."""
 
     metric_name = "acc"
 

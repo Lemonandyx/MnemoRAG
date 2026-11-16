@@ -17,22 +17,12 @@ from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 from vllm.v1.serial_utils import UtilityResult
 
-# These are possible values of RequestOutput.finish_reason,
-# so form part of the external API.
+# Completion reasons form part of the request-output API.
 FINISH_REASON_STRINGS = ("stop", "length", "abort")
 
 
 class FinishReason(enum.IntEnum):
-    """
-    Reason a request finished - stop, length, or abort.
-
-    Int rather than Str for more compact serialization.
-
-    stop - a stop string was emitted
-    length - max_tokens was consumed, or max_model_len was reached
-    abort - aborted for another reason
-
-    """
+    """Request completion reason: stop, length limit, or abort."""
 
     STOP = 0
     LENGTH = 1
@@ -60,13 +50,10 @@ class EngineCoreRequest(
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
 
-    # Index of the client, used to ensure outputs are sent back to the same
-    # client for this request when scaling out the front-end.
+    # Route outputs back to the originating client.
     client_index: int = 0
 
-    # Used in DP case to indicate which wave of requests this is expected to
-    # belong to, to cover a race condition where the request is sent before
-    # a wave finished notification is received.
+    # Track the data-parallel wave when requests race with completion notifications.
     current_wave: int = 0
     priority: int = 0
 
@@ -90,12 +77,7 @@ class EngineCoreEventType(enum.IntEnum):
 
 
 class EngineCoreEvent(msgspec.Struct):
-    """A timestamped engine core event associated with a request.
-
-    The timestamp is a monotonic timestamps and is used for by the engine
-    frontend to calculate intervals between engine core events. These
-    timestamps should not be compared with timestamps from other processes.
-    """
+    """Engine event timestamped by a monotonic clock."""
 
     type: EngineCoreEventType
     timestamp: float
@@ -158,8 +140,6 @@ class EngineCoreOutputs(
     omit_defaults=True,  # type: ignore[call-arg]
     gc=False,
 ):  # type: ignore[call-arg]
-    # NOTE(Nick): We could consider ways to make this more compact,
-    # e.g. columnwise layout
 
     engine_index: int = 0
 
@@ -184,10 +164,7 @@ class EngineCoreOutputs(
 
 
 class EngineCoreRequestType(enum.Enum):
-    """
-    Request types defined as hex byte strings, so it can be sent over sockets
-    without separate encoding step.
-    """
+    """Socket request types encoded as byte strings."""
 
     ADD = b"\x00"
     ABORT = b"\x01"
@@ -206,9 +183,7 @@ class ReconfigureDistributedRequest(msgspec.Struct):
 
 
 class ReconfigureRankType(enum.IntEnum):
-    """
-    Rank type for reconfiguring distributed request.
-    """
+    """Rank role in a distributed reconfiguration."""
 
     KEEP_CURRENT_RANK = -1
     SHUTDOWN_CURRENT_RANK = -2

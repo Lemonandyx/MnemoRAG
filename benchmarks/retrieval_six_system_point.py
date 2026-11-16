@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one fair six-system retrieval point on a locked 512-query trace."""
+"""Run the six-system retrieval comparison."""
 
 from __future__ import annotations
 
@@ -178,7 +178,7 @@ def direct_args(args: argparse.Namespace, system: str) -> argparse.Namespace:
 
 
 class GPTCacheRetrievalEngine:
-    """Use GPTCache's official SQLite+FAISS manager as a retrieval-result cache."""
+    """Cache retrieval results with GPTCache's SQLite/Faiss manager."""
 
     def __init__(self, args: argparse.Namespace, point_dir: Path) -> None:
         import faiss
@@ -466,9 +466,8 @@ def run_hedra(
         now = time.perf_counter() - origin
         for task, row_ids in zip(task_ids, ids):
             request_id = int(task.id)
-            # HedraRAG reuses the TaskID object after speculative emission and
-            # does not clear its is_spec flag.  Removal from request_dict is the
-            # authoritative final-completion signal in the official engine.
+            # HedraRAG reuses TaskID without clearing is_spec; removal from
+            # request_dict marks final completion.
             if request_id in engine.request_dict:
                 continue
             if request_id not in completed:

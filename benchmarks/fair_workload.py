@@ -1,4 +1,4 @@
-"""Canonical request-arrival traces for cross-system serving experiments."""
+"""Request-arrival traces for serving experiments."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def file_sha256(path: Path) -> str:
 
 
 def build_arrival_offsets(spec: ArrivalTraceSpec) -> np.ndarray:
-    """Generate the single arrival trace replayed by every compared system."""
+    """Generate arrival offsets for the compared systems."""
     request_count = int(spec.request_count)
     request_rate = float(spec.request_rate)
     burstiness = float(spec.burstiness)
@@ -127,7 +127,7 @@ def validate_trace_workload(
     sample_indices: Iterable[int],
     dataset_sha256: str,
 ) -> None:
-    """Reject a trace that was not built for the exact evaluated workload."""
+    """Check that a trace matches the evaluated workload."""
     if manifest.get("spec") != asdict(spec):
         raise ValueError("arrival trace specification does not match this point")
     observed_sample_digest = array_sha256(_canonical_int64(sample_indices))
@@ -166,7 +166,7 @@ def write_trace_bundle(
     sample_indices: Iterable[int] | None = None,
     dataset_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Atomically persist a trace and the fingerprints used for result audits."""
+    """Save a trace and its workload fingerprints atomically."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     canonical = validate_arrival_offsets(offsets, request_count=spec.request_count)
@@ -259,6 +259,5 @@ def select_sample_indices(
         )
     rng = np.random.default_rng(int(random_seed))
     selected = rng.choice(candidates, size=sample_count, replace=False)
-    # Request order is part of a cross-request caching workload. Preserve the
-    # seeded permutation instead of converting it into dataset-source order.
+    # Preserve the seeded request order for cross-request caching.
     return selected.astype("<i8", copy=False)

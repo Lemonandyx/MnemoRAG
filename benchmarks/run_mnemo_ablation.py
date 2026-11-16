@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the repeated, request-matched MnemoRAG component ablation."""
+"""Run the MnemoRAG component ablation."""
 
 from __future__ import annotations
 

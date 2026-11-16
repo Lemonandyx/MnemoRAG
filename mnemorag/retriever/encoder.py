@@ -9,21 +9,7 @@ from mnemorag.utils import get_device
 
 
 class Encoder:
-    """
-    Encoder class for encoding queries using a specified model.
-
-    Attributes:
-        model_name (str): The name of the model.
-        model_path (str): The path to the model.
-        pooling_method (str): The method used for pooling.
-        max_length (int): The maximum length of the input sequences.
-        use_fp16 (bool): Whether to use FP16 precision.
-        instruction (str): Additional instructions for parsing queries.
-
-    Methods:
-        encode(query_list: List[str], is_query=True) -> np.ndarray:
-            Encodes a list of queries into embeddings.
-    """
+    """Encode queries and documents as dense vectors."""
 
     def __init__(
         self,

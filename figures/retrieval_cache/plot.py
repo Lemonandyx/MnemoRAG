@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot retrieval latency from external result summaries."""
+"""Plot retrieval latency from result summaries."""
 
 from __future__ import annotations
 

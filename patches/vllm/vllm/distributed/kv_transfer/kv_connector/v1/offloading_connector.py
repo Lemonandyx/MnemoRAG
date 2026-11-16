@@ -265,7 +265,7 @@ class OffloadingConnector(KVConnectorBase_V1):
 
 
 class OffloadingConnectorScheduler:
-    """Implementation of Scheduler side methods"""
+    """Schedule CPU KV loads and stores."""
 
     def __init__(self, spec: OffloadingSpec):
         self.gpu_block_size = spec.gpu_block_size
@@ -320,16 +320,13 @@ class OffloadingConnectorScheduler:
         # request blocks are stored in order
         # index of next block (of size offloaded_block_size) to offload
         self._next_stored_block_idx: dict[ReqId, int] = {}
-        # Local prefix length observed during connector lookup. In synchronous
-        # mode allocate_slots also reserves blocks for compute in the same step,
-        # so block hashes alone cannot distinguish local hits from new work.
+        # Track local hits separately from blocks reserved for same-step compute.
         self._load_start_tokens: dict[ReqId, int] = {}
 
         # request ID -> set(block hashes being stored/load)
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
-        # Sync loads are consumed in the same model step. They must not be
-        # re-enqueued through WAITING_FOR_REMOTE_KVS on the next scheduler step.
+        # Same-step sync loads must not enter the remote-KV waiting queue.
         self._sync_load_req_ids: set[ReqId] = set()
         self._h2d_wait_started_s: dict[ReqId, float] = {}
         self._worker_duration_samples: dict[bool, deque[float]] = {
@@ -623,22 +620,7 @@ class OffloadingConnectorScheduler:
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int, bool]:
-        """
-        Get number of new tokens that can be loaded beyond the
-        num_computed_tokens.
-
-        Args:
-            request (Request): the request object.
-            num_computed_tokens (int): the number of locally
-                computed tokens for this request
-
-        Returns:
-            A tuple with the following elements:
-                - The number of tokens that can be loaded beyond what is
-                  already computed.
-                - `True` if tokens will be loaded asynchronously
-                  (between scheduler steps).
-        """
+        """Return additional cached tokens and whether loading is asynchronous."""
         num_blocks = request.num_tokens // self.offloaded_block_size
 
         assert len(request.block_hashes) // self.block_size_factor == num_blocks
@@ -648,7 +630,6 @@ class OffloadingConnectorScheduler:
 
         full_block_tokens = self.offloaded_block_size * num_blocks
         if full_block_tokens - num_computed_tokens < self.offloaded_block_size:
-            # we can load less than a block, skip
             return 0, False
 
         start_block_idx = num_computed_tokens // self.offloaded_block_size
@@ -737,7 +718,6 @@ class OffloadingConnectorScheduler:
 
     def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
         reqs_to_store: dict[ReqId, TransferSpec] = {}
-        # iterate over both new and cached requests
         for req_id, new_block_id_groups, preempted in yield_req_data(scheduler_output):
             if preempted:
                 self._request_block_ids[req_id] = []
@@ -882,13 +862,7 @@ class OffloadingConnectorScheduler:
         return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
-        """
-        Update KVConnector state from worker-side connectors output.
-
-        Args:
-            connector_output (KVConnectorOutput): the worker-side
-                connectors output.
-        """
+        """Apply worker-side transfer results."""
         self._consume_worker_transfer_stats(
             connector_output.kv_connector_stats
         )
@@ -908,9 +882,8 @@ class OffloadingConnectorScheduler:
                 sync_finished.add(req_id)
 
         if sync_finished and connector_output.finished_recving is not None:
-            # Scheduler.update_from_output runs after this callback. Hide
-            # same-step sync completions so it does not retain them as remote
-            # receives for requests that are already RUNNING.
+            # Hide sync completions from the scheduler's later output update
+            # to avoid marking running requests as remote receives.
             connector_output.finished_recving = set(
                 connector_output.finished_recving
             ) - sync_finished
@@ -920,16 +893,7 @@ class OffloadingConnectorScheduler:
         request: Request,
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
-        """
-        Called when a request has finished, before its blocks are freed.
-
-        Returns:
-            True if the request is being saved/sent asynchronously and blocks
-            should not be freed until the request_id is returned from
-            get_finished().
-            Optional KVTransferParams to be included in the request outputs
-            returned by the engine.
-        """
+        """Return whether transfers must retain blocks, along with transfer parameters."""
         req_id = request.request_id
         self._requests.pop(req_id, None)
         self._request_block_ids.pop(req_id, None)
@@ -938,19 +902,14 @@ class OffloadingConnectorScheduler:
         self._tail_blocks_skipped_by_req.pop(req_id, None)
         self._cold_admission_blocks_by_req.pop(req_id, None)
 
-        # TODO(orozery): possibly kickoff offload for last block
-        # which may have been deferred due to async scheduling
+        # Async scheduling may defer offloading the final block.
         self._next_stored_block_idx.pop(req_id, None)
 
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
-        """Take the KV cache events from the connector.
-
-        Returns:
-            A list of KV cache events.
-        """
+        """Return pending KV cache events."""
         for event in self.manager.take_events():
             if event.removed:
                 yield BlockRemoved(block_hashes=event.block_hashes, medium=event.medium)
@@ -966,14 +925,12 @@ class OffloadingConnectorScheduler:
 
 
 class OffloadingConnectorWorker:
-    """Implementation of Worker side methods"""
+    """Execute CPU KV transfer jobs."""
 
     def __init__(self, spec: OffloadingSpec):
         self.spec = spec
         self.worker = OffloadingWorker()
-        # The connector exists only when CPU KV offload is enabled. Batch each
-        # scheduler step by default so direct deployments and benchmarks use
-        # the same transfer policy.
+        # Batch transfers per scheduler step by default.
         batch_all = os.environ.get("VLLM_CPU_KV_BATCH_TRANSFERS", "1") == "1"
         self.batch_h2d_transfers = (
             os.environ.get(
@@ -1217,15 +1174,7 @@ class OffloadingConnectorWorker:
             self._start_transfer((req_id,), [transfer_spec], store=True)
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
-        """
-        Notifies worker-side connector ids of requests that have
-        finished generating tokens.
-        Returns a list of request IDs that finished loading or storing.
-
-        Returns:
-            ids of requests that have finished asynchronous transfer
-            tuple of (sending/saving ids, recving/loading ids).
-        """
+        """Return completed sending and receiving request-ID sets."""
         finished_sending = set()
         finished_recving = set()
         finished = self.worker.get_finished()
@@ -1236,7 +1185,7 @@ class OffloadingConnectorWorker:
             else {}
         )
         for job_id, success in finished:
-            # we currently do not support job failures
+            # Transfer job failures are not supported.
             assert success
             req_ids, store = self._jobs.pop(job_id)
             started_s = self._job_started_s.pop(job_id)
@@ -1282,15 +1231,10 @@ class OffloadingConnectorWorker:
 def yield_req_data(
     scheduler_output,
 ) -> Iterator[tuple[str, tuple[list[int], ...], bool]]:
-    """
-    Yields:
-        (req_id, new_block_id_groups, preempted)
-    """
-    # new requests
+    """Yield request IDs, block groups, and preemption flags."""
     for req_data in scheduler_output.scheduled_new_reqs:
         yield req_data.req_id, req_data.block_ids, False
 
-    # cached requests
     cached_reqs = scheduler_output.scheduled_cached_reqs
     yield from zip(
         cached_reqs.req_ids,

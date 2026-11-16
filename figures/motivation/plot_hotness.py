@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot a document-access heatmap from an external aggregate table."""
+"""Plot document-access heat from a CSV table."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Retrieval backends shared by the paper comparison."""
+"""Retrieval backends for comparison experiments."""
 
 from __future__ import annotations
 
@@ -103,7 +103,7 @@ class DocumentVectorStore:
 
 
 class FaissBackend:
-    """QVCache custom backend over the campaign's common IVF index."""
+    """QVCache backend over the shared IVF index."""
 
     def __init__(
         self, index, vectors: DocumentVectorStore, metric: str = "cosine"
@@ -236,23 +236,16 @@ class DirectEngine:
         from utils.index import HNSWLibIndexerV2
 
         self.vector_store = DocumentVectorStore()
-        # Controlled comparison: HaS's fuzzy channel and fallback share the
-        # exact same IVF4096,Flat corpus index as every other system.  Only the
-        # fuzzy pass lowers nprobe to 64; no independent IVFPQ/PQ artifact is
-        # used in the main figure.
+        # Use the shared IVF index for HaS's fuzzy search and fallback.
         self.has_index = self.index
         self.has_cache = CacheChannel()
         self.has_cache.index = HNSWLibIndexerV2(vector_sz=1024)
-        # The official implementation reserves max_size * 30 HNSW vector
-        # slots.  With top-k=5 and 1024 requests, 2048 query entries already
-        # cover the complete trace without eviction while avoiding a needless
-        # 3-million-vector preallocation.
+        # Limit HNSW preallocation while retaining the full request trace.
         self.has_cache.reset(self.args.has_cache_capacity)
 
     @staticmethod
     def _materialize(corpus, ids: np.ndarray) -> None:
-        # Match the existing Figure 13 path: retrieval completes only once the
-        # selected document records are available to the caller.
+        # Include document loading in retrieval latency.
         flat = ids.reshape(-1).tolist()
         _ = [corpus[index] for index in flat]
 

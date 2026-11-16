@@ -1,10 +1,4 @@
-"""Online request scheduler used by the formal MnemoRAG benchmarks.
-
-The scheduler deliberately keeps arrival pacing, workflow concurrency, and
-vLLM admission as separate layers. Requests enter an unbounded arrival queue
-at their configured timestamps; workers drain only requests that are already
-ready, and the persistent AsyncLLM engine owns generation backpressure.
-"""
+"""Schedule requests using an open-loop arrival trace."""
 
 from __future__ import annotations
 
@@ -67,12 +61,7 @@ async def poisson_persistent_workflow_run(
     normalize_arrival_trace=True,
     record_request_timing=False,
 ):
-    """Serve One-Pass, IRG, or RECOMP requests on an open-loop timeline.
-
-    Retrieval remains serialized by ``AsyncPipeline._retrieve_async``. Each
-    worker returns to the request queue only after its workflow batch finishes,
-    while generation submitted by another worker remains active in AsyncLLM.
-    """
+    """Run One-Pass, IRG, or RECOMP with open-loop arrivals."""
     workflow_name = str(workflow).strip().upper()
     recomp_runner = getattr(pipeline, "run_stream_recomp", None)
     if recomp_runner is None:

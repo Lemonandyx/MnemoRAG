@@ -27,18 +27,10 @@ def expand_block_ids(
     output: np.ndarray,
     skip_count: int = 0,
 ):
-    """
-    Convert a list of block IDs to a list of matching block ids,
-    assuming each block is composed of actual block_size_factor blocks.
-    Outputs to output tensor.
-    The first skip_count blocks will be skipped.
-    Note that skip_count must be less than block_size_factor.
+    """Expand logical block IDs into physical IDs in the output tensor.
 
-    For example, if block_ids = [0, 1, 3] and block_size_factor =  4,
-    then it yields [0, 1, 2, 3, 4, 5, 6, 7, 12, 13, 14, 15]
-    since 0 maps to [0, 1, 2, 3]
-    1 maps to [4, 5, 6, 7]
-    and 3 maps to [12, 13, 14, 15]
+    Skip skip_count IDs from the first logical block; skip_count must be
+    smaller than block_size_factor.
     """
     assert skip_count < block_size_factor
 
@@ -74,7 +66,6 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         assert cpu_block_size % gpu_block_size == 0
         self.block_size_factor = cpu_block_size // gpu_block_size
 
-        # cuda streams for gpu->cpu and cpu->gpu
         self.d2h_stream_priority = int(
             os.environ.get("VLLM_CPU_KV_D2H_STREAM_PRIORITY", "0")
         )
@@ -103,8 +94,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
                 self.sync_d2h,
             )
 
-        # job_id -> (start, completion) CUDA events. Timing-enabled events let
-        # the connector distinguish actual copy time from completion polling.
+        # CUDA events measure transfer duration independently of completion polling.
         self.transfer_events: dict[int, tuple[torch.Event, torch.Event]] = {}
         self.events_pool: list[tuple[torch.Event, torch.Event]] = []
         self.completed_cuda_duration_s: dict[int, float] = {}
@@ -140,7 +130,6 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             pin_memory,
         )
 
-        # allocate cpu tensors
         logger.info("Allocating %d CPU tensors...", len(gpu_caches))
         self.gpu_tensors: list[torch.Tensor] = []
         self.cpu_tensors: list[torch.Tensor] = []
@@ -180,8 +169,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
             )
 
             if len(gpu_shape) != len(test_shape):
-                # cross-layers tensor
-                # shape is (num_blocks, ...)
+                # Shared cross-layer tensor: (num_blocks, ...).
                 assert len(gpu_shape) == len(test_shape) + 1
                 num_blocks_idx = 0
                 self.kv_dim_before_num_blocks.append(False)
@@ -280,7 +268,7 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         dtype: torch.dtype,
         tensor_index: int,
     ) -> torch.Tensor:
-        """Map the lazy tier without pre-faulting its logical capacity."""
+        """Map CPU storage without pre-faulting pages."""
         mmap_dir = os.environ.get("VLLM_CPU_KV_LAZY_MMAP_DIR", "/dev/shm")
         if not os.path.isdir(mmap_dir):
             raise ValueError(
@@ -633,7 +621,6 @@ class CpuGpuOffloadingHandler(OffloadingHandler):
         if needs_staging:
             self.active_staging_job[direction] = job_id
 
-        # success
         return True
 
     def get_finished(self) -> list[TransferResult]:

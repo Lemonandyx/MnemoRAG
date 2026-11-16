@@ -124,9 +124,7 @@ class PromptTemplate:
                 matched_part = part
                 start = result.find(matched_part, cursor)
                 if start < 0:
-                    # Chat templates such as Llama-3 trim trailing whitespace
-                    # from the complete system message. For the final document,
-                    # locate the same content without its formatting newline.
+                    # Chat templates may trim the final document's trailing newline.
                     matched_part = part.rstrip()
                     start = result.find(matched_part, cursor)
                 if start < 0:
@@ -148,7 +146,7 @@ class PromptTemplate:
         retrieval_result,
         return_parts=False,
     ):
-        """Format reordered documents and retain stable document identities."""
+        """Format reordered documents with their document IDs."""
         reference_parts = []
         doc_id_to_doc_number = {}
         for idx, doc_item in enumerate(retrieval_result):

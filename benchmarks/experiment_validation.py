@@ -1,4 +1,4 @@
-"""Shared validation for resumable, resource-controlled experiments."""
+"""Shared experiment validation."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def expected_prompt_contract(
     recomp_compression_max_tokens: int = DEFAULT_RECOMP_COMPRESSION_MAX_TOKENS,
     ordering_mode: str = "retrieval",
 ) -> dict:
-    """Return the prompt and per-stage generation contract used in comparisons."""
+    """Return prompt settings and token budgets for each stage."""
     if ordering_mode not in ORDERING_PROMPT_POLICIES:
         raise ValueError(f"Unsupported prompt ordering mode: {ordering_mode}")
     return {
@@ -89,7 +89,7 @@ def verified_complete(
 
 
 def verified_point_contract(summary: dict, expected: dict) -> bool:
-    """Require cached output to match every workload-defining field."""
+    """Check cached results against the workload settings."""
     missing = object()
     for name, expected_value in expected.items():
         actual_value = summary.get(name, missing)
@@ -114,7 +114,7 @@ def verified_point_contract(summary: dict, expected: dict) -> bool:
 
 
 def verified_quality_contract(summary: dict, topk: int) -> bool:
-    """Require exactly Recall@k for retrieval and F1/ACC for generation."""
+    """Check retrieval and generation metric settings."""
     contract = summary.get("metric_contract") or {}
     retrieval = contract.get("retrieval") or {}
     metrics = summary.get("metrics") or {}
@@ -146,7 +146,7 @@ def verified_prompt_contract(
     recomp_compression_max_tokens: int = DEFAULT_RECOMP_COMPRESSION_MAX_TOKENS,
     ordering_mode: str = "retrieval",
 ) -> bool:
-    """Reject results produced with a different prompt or stage budget."""
+    """Check prompt settings and stage token budgets."""
     expected = expected_prompt_contract(
         max_model_len=max_model_len,
         answer_max_tokens=answer_max_tokens,
@@ -163,7 +163,7 @@ def verified_evaluation_contract(
     *,
     ordering_mode: str,
 ) -> bool:
-    """Require both the quality metric and prompt/generation contracts."""
+    """Check metric, prompt, and generation settings."""
     return verified_quality_contract(summary, topk) and verified_prompt_contract(
         summary, ordering_mode=ordering_mode
     )

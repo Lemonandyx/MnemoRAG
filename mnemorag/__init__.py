@@ -1,4 +1,4 @@
-"""Stable public interface for MnemoRAG serving."""
+"""MnemoRAG serving interface."""
 
 from mnemorag.config import Config
 from mnemorag.dataset import Dataset
@@ -7,7 +7,7 @@ from mnemorag.version import __version__
 
 
 class MnemoRAGPipeline(AsyncPipeline):
-    """Public entry point for MnemoRAG serving."""
+    """Entry point for MnemoRAG serving."""
 
 
 __all__ = ["Config", "Dataset", "MnemoRAGPipeline", "__version__"]

@@ -6,17 +6,7 @@ def resolve_max_tokens(
     generation_params: dict,
     prioritize_new_tokens: bool = False,
 ) -> dict:
-    """Resolve ``max_tokens`` and ``max_new_tokens`` without ambiguity.
-
-    Args:
-        params: Dictionary containing user-provided parameters
-        generation_params: Dictionary containing generation-specific parameters
-        prioritize_new_tokens: If True, max_new_tokens takes precedence over max_tokens
-                             If False, max_tokens takes precedence (default behavior)
-
-    Returns:
-        Updated generation_params dictionary
-    """
+    """Resolve token limits, preferring max_new_tokens when requested."""
 
     def get_token_params(param_dict: dict) -> tuple:
         """Extract max_tokens and max_new_tokens from a parameter dictionary."""
@@ -26,10 +16,7 @@ def resolve_max_tokens(
         )
 
     def resolve_tokens(max_tokens: int, max_new_tokens: int) -> int:
-        """
-        Resolve between max_tokens and max_new_tokens values based on priority.
-        Returns the resolved token value or None if no valid value found.
-        """
+        """Choose a token limit using the requested precedence."""
         if max_tokens is None:
             return max_new_tokens
         if max_new_tokens is None:

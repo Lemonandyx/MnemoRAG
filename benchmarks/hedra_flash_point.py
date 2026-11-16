@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Run one isolated HedraRAG or Hedra-provided FlashRAG comparison point.
+"""Run a HedraRAG or FlashRAG serving experiment.
 
-The two systems retain their own executor and retrieval implementations.  The
-request state machines below only normalize prompts, IRG query updates, RECOMP
-stages, and final-output selection to the MnemoRAG evaluation contract.
+Use common prompts and generation budgets for the compared workflows.
 """
 
 from __future__ import annotations
@@ -114,7 +112,7 @@ DATASET_PATHS = {
 
 
 def install_hedra_engine_args_contract(generator_module, args) -> list[dict]:
-    """Inject common scheduler limits into Hedra's otherwise fixed EngineArgs."""
+    """Set common scheduler limits in HedraRAG's engine arguments."""
     original_engine_args = generator_module.EngineArgs
     calls: list[dict] = []
     required = {
@@ -285,9 +283,7 @@ def configure(args: argparse.Namespace) -> list[int]:
     ):
         os.environ[name] = str(args.cpu_threads)
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    # The HedraRAG config initializes CUDA before vLLM constructs its V1 core.
-    # Fork would inherit an initialized CUDA runtime and fail; spawn preserves
-    # the native multiprocess engine without changing executor semantics.
+    # Spawn avoids inheriting CUDA state initialized by HedraRAG.
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
     args.resource_preflight = resource_preflight(args, selected)
@@ -300,10 +296,9 @@ def configure(args: argparse.Namespace) -> list[int]:
 
 
 def ensure_native_hedra_faiss(args: argparse.Namespace) -> None:
-    """Restart Hedra points with the artifact's custom FAISS on the loader path.
+    """Load HedraRAG's Faiss build for its GPU baseline.
 
-    FlashRAG points deliberately stay on the shared FAISS 1.8 environment so
-    the custom Hedra extensions cannot alter the baseline implementation.
+    FlashRAG uses Faiss 1.8.0.
     """
     if args.system != "hedrarag" or os.environ.get("HEDRA_CUSTOM_FAISS_ACTIVE") == "1":
         return
@@ -449,8 +444,7 @@ def score_prediction(prediction: str, golden) -> dict[str, float]:
     for answer in answers(golden):
         gold = normalize(answer)
         gold_text = " ".join(gold)
-        # Match FlashRAG's token metric contract: boolean/no-answer labels
-        # receive credit only on an exact normalized label match.
+        # Boolean and no-answer labels require an exact normalized match.
         special_answers = {"yes", "no", "noanswer"}
         special_mismatch = (
             pred_text in special_answers and pred_text != gold_text
@@ -525,7 +519,7 @@ def collect_quality_observations(output_list, rows, topk: int, expected_count: i
 
 
 class CommonPromptBuilder:
-    """Reproduce MnemoRAG's PromptTemplate without importing its runtime."""
+    """Build the comparison prompts without loading the MnemoRAG runtime."""
 
     system_template = CANONICAL_SYSTEM_PROMPT
     user_template = CANONICAL_USER_PROMPT
@@ -611,7 +605,7 @@ RECOMP_COMPRESSION_PROMPT_MARKERS = (
 
 
 def install_generation_budget_router(executor, args):
-    """Route token budgets by immutable prompt identity, not mutable stage state."""
+    """Route token budgets by prompt identity."""
     original_add_request = executor.generator.add_request
     routing_stats = collections.Counter()
 
@@ -1070,7 +1064,7 @@ def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         args.topk,
         args.num_requests,
     )
-    # Quality reference work runs after the serving timer and resource monitor stop.
+    # Evaluate quality after stopping the serving timer and resource monitor.
     from mnemorag.retriever.encoder import Encoder
 
     quality_encoder = Encoder(

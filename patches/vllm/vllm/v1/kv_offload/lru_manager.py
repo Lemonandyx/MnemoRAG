@@ -14,9 +14,7 @@ from vllm.v1.kv_offload.backend import Backend, BlockStatus
 
 
 class LRUOffloadingManager(OffloadingManager):
-    """
-    An OffloadingManager with a pluggable backend, which evicts blocks by LRU.
-    """
+    """Manage an offload backend with LRU eviction."""
 
     def __init__(self, backend: Backend, enable_events: bool = False):
         self.backend: Backend = backend
@@ -61,7 +59,6 @@ class LRUOffloadingManager(OffloadingManager):
         self, block_hashes: Iterable[BlockHash]
     ) -> PrepareStoreOutput | None:
         block_hashes = list(block_hashes)
-        # filter out blocks that are already stored
         block_hashes_to_store = [
             block_hash
             for block_hash in block_hashes
@@ -72,7 +69,6 @@ class LRUOffloadingManager(OffloadingManager):
             len(block_hashes_to_store) - self.backend.get_num_free_blocks()
         )
 
-        # build list of blocks to evict
         to_evict = []
         if num_blocks_to_evict > 0:
             for block_hash, block in self.blocks.items():
@@ -87,7 +83,6 @@ class LRUOffloadingManager(OffloadingManager):
             if len(to_evict) == 0:
                 return None
 
-        # evict blocks
         for block_hash in to_evict:
             self.backend.free(self.blocks.pop(block_hash))
 
@@ -106,7 +101,6 @@ class LRUOffloadingManager(OffloadingManager):
 
         for block_hash, block in zip(block_hashes_to_store, blocks):
             self.blocks[block_hash] = block
-        # build store specs for allocated blocks
         store_spec = self.backend.get_load_store_spec(block_hashes_to_store, blocks)
 
         return PrepareStoreOutput(

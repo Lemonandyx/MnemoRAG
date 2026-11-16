@@ -194,7 +194,7 @@ class QueryPool:
         return packed, lengths
 
     def save_snapshot(self, path, *, metadata=None):
-        """Persist a portable, pickle-free Query Base warm-start snapshot."""
+        """Save a Query Base snapshot."""
         if self.current_size() == 0 or self.embedding_matrix is None:
             raise ValueError("cannot snapshot an empty QueryPool")
         path = Path(path)
@@ -256,7 +256,7 @@ class QueryPool:
         return values[index, :length].tolist() if length else None
 
     def load_snapshot(self, path):
-        """Load a Query Base snapshot before timed request processing begins."""
+        """Load a Query Base snapshot."""
         path = Path(path)
         with np.load(path, allow_pickle=False) as snapshot:
             metadata = json.loads(str(snapshot["metadata_json"].item()))
@@ -384,7 +384,7 @@ class DocumentPool:
         )
 
     def update(self, doc_ids: Iterable[Hashable]):
-        """Update exact document-access counts with bounded dense storage."""
+        """Update document-access counts."""
         if self.freeze_prior:
             return
         doc_ids = list(doc_ids)

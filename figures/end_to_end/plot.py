@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot an end-to-end latency grid from an external aggregate table."""
+"""Plot end-to-end latency from a CSV table."""
 
 from __future__ import annotations
 

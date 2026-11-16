@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot component speedup and quality from the aggregate table."""
+"""Plot component speedup and quality from a CSV table."""
 
 from __future__ import annotations
 

@@ -1,1 +1,1 @@
-"""Formal online-scheduling helpers for MnemoRAG benchmarks."""
+"""Online scheduling helpers for MnemoRAG benchmarks."""
