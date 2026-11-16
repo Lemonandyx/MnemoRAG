@@ -8,6 +8,19 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 import datasets
+import numpy as np
+
+
+def _convert_numpy(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _convert_numpy(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_convert_numpy(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 class Item:
@@ -60,14 +73,12 @@ class Item:
             self.update_output(key, value)
 
     def to_dict(self) -> dict[str, Any]:
-        from mnemorag.dataset.utils import convert_numpy
-
         result = {
-            key: convert_numpy(value)
+            key: _convert_numpy(value)
             for key, value in self.data.items()
             if key != "output"
         }
-        output = convert_numpy(self.output)
+        output = _convert_numpy(self.output)
         result["output"] = output
         return result
 

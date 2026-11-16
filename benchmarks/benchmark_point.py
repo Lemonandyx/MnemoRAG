@@ -18,7 +18,6 @@ import csv
 import hashlib
 import json
 import math
-import multiprocessing
 import os
 import platform
 import random
@@ -158,116 +157,6 @@ DEFAULT_CPU_KV_BLOCK_SIZE = 16
 REQUIRED_PHYSICAL_CPU_CORES = 64
 REQUIRED_FAISS_SEARCH_WORKERS = 64
 REQUIRED_FAISS_OMP_THREADS = 1
-MIN_GPU_RESERVATION_HANDOFF_MIB = 128.0
-
-
-def _hold_startup_gpu_reservation(
-    memory_mib: float,
-    ready_connection,
-    release_event,
-) -> None:
-    """Occupy the selected GPU while the CPU-side index is loading."""
-    try:
-        import torch
-
-        byte_count = max(1, int(memory_mib * 1024 * 1024))
-        reservation = torch.empty(
-            byte_count,
-            dtype=torch.uint8,
-            device="cuda:0",
-        )
-        reservation.zero_()
-        torch.cuda.synchronize()
-        ready_connection.send(
-            {
-                "status": "ready",
-                "pid": os.getpid(),
-                "allocated_bytes": byte_count,
-            }
-        )
-        release_event.wait()
-        del reservation
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-    except BaseException as error:  # pragma: no cover - host diagnostic
-        try:
-            ready_connection.send(
-                {
-                    "status": "error",
-                    "error": f"{type(error).__name__}: {error}",
-                }
-            )
-        except (BrokenPipeError, EOFError, OSError):
-            pass
-        raise
-    finally:
-        ready_connection.close()
-
-
-def start_startup_gpu_reservation(memory_mib: float) -> dict | None:
-    if memory_mib <= 0:
-        return None
-    context = multiprocessing.get_context("spawn")
-    ready_parent, ready_child = context.Pipe(duplex=False)
-    release_event = context.Event()
-    process = context.Process(
-        target=_hold_startup_gpu_reservation,
-        args=(memory_mib, ready_child, release_event),
-        name="MnemoRAG-GPUReservation",
-    )
-    process.start()
-    ready_child.close()
-    if not ready_parent.poll(60):
-        process.terminate()
-        process.join(timeout=10)
-        raise RuntimeError("Timed out while reserving the startup GPU")
-    report = ready_parent.recv()
-    ready_parent.close()
-    if report.get("status") != "ready":
-        process.join(timeout=10)
-        raise RuntimeError(f"Unable to reserve the startup GPU: {report}")
-    report.update(
-        {
-            "requested_mib": float(memory_mib),
-            "released": False,
-            "release_exitcode": None,
-        }
-    )
-    print(
-        "Startup GPU reservation: " + json.dumps(report, sort_keys=True),
-        flush=True,
-    )
-    return {
-        "process": process,
-        "release_event": release_event,
-        "report": report,
-    }
-
-
-def release_startup_gpu_reservation(handle: dict | None) -> dict | None:
-    if handle is None:
-        return None
-    report = handle["report"]
-    if report.get("released"):
-        return report
-    process = handle["process"]
-    handle["release_event"].set()
-    process.join(timeout=30)
-    if process.is_alive():
-        process.terminate()
-        process.join(timeout=10)
-    if process.is_alive():
-        process.kill()
-        process.join(timeout=10)
-    report["released"] = not process.is_alive()
-    report["release_exitcode"] = process.exitcode
-    if not report["released"] or process.exitcode != 0:
-        raise RuntimeError(f"Startup GPU reservation did not exit cleanly: {report}")
-    print(
-        "Startup GPU reservation released: " + json.dumps(report, sort_keys=True),
-        flush=True,
-    )
-    return report
 
 
 def release_loaded_input_page_cache(paths: list[Path]) -> dict[str, object]:
@@ -381,16 +270,7 @@ def parse_args() -> argparse.Namespace:
         choices=("original", "hotness", "hotness_hint"),
         default="hotness_hint",
     )
-    parser.add_argument("--num-requests", type=int, default=1024)
-    parser.add_argument(
-        "--request-cycle-size",
-        type=int,
-        default=0,
-        help=(
-            "Cycle the first N sampled requests to create a controlled "
-            "temporal-reuse trace; zero keeps all sampled requests unique."
-        ),
-    )
+    parser.add_argument("--num-requests", type=int, default=512)
     parser.add_argument("--arrival-rate", type=float, default=24.0)
     parser.add_argument(
         "--arrival-burstiness",
@@ -479,15 +359,6 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "fp8"),
         default="auto",
         help="vLLM GPU KV-cache dtype. Figure 14 uses fp8.",
-    )
-    parser.add_argument(
-        "--startup-gpu-reservation-mib",
-        type=float,
-        default=0.0,
-        help=(
-            "Temporarily reserve target-GPU memory while the CPU-side index "
-            "loads, then hand ownership to the retriever before vLLM starts."
-        ),
     )
     parser.add_argument(
         "--prefix-caching",
@@ -1635,90 +1506,6 @@ def load_retrieval_reference(
     return reference_ids, reference_scores, canonical_sha256(reference_ids)
 
 
-def load_retrieval_replay_csv(
-    path: Path,
-    *,
-    expected_count: int,
-    expected_topk: int,
-) -> list[dict[str, object]]:
-    """Load query-checked retrieval results for replay."""
-    replay = []
-    with path.open(newline="", encoding="utf-8") as stream:
-        for expected_index, row in enumerate(csv.DictReader(stream)):
-            request_index = int(row["request_index"])
-            if request_index != expected_index:
-                raise ValueError(
-                    "Retrieval replay request indices must be contiguous and "
-                    f"ordered; expected {expected_index}, observed {request_index}"
-                )
-            ids = [int(value) for value in json.loads(row["retrieval_idxs"])]
-            scores = [float(value) for value in json.loads(row["retrieval_scores"])]
-            if len(ids) != expected_topk or len(scores) != expected_topk:
-                raise ValueError(
-                    f"Retrieval replay row has {len(ids)} IDs and "
-                    f"{len(scores)} scores; expected top-k={expected_topk}"
-                )
-            replay.append(
-                {
-                    "request_index": request_index,
-                    "question": str(row["question"]),
-                    "ids": ids,
-                    "scores": scores,
-                }
-            )
-    if len(replay) != expected_count:
-        raise ValueError(
-            f"Retrieval replay contains {len(replay)} requests; "
-            f"expected {expected_count}"
-        )
-    return replay
-
-
-def install_retrieval_replay(retriever, replay, load_documents):
-    """Install deterministic replay while rejecting query-order drift."""
-    state = {"cursor": 0}
-
-    def replay_batch_search(queries, *positional, **keywords):
-        if positional:
-            raise TypeError("retrieval replay requires keyword search options")
-        query_list = [queries] if isinstance(queries, str) else list(queries)
-        begin = state["cursor"]
-        end = begin + len(query_list)
-        if end > len(replay):
-            raise RuntimeError("retrieval replay exhausted before the workload")
-        rows = replay[begin:end]
-        for offset, (query, row) in enumerate(zip(query_list, rows)):
-            if str(query) != row["question"]:
-                raise RuntimeError(
-                    "retrieval replay query mismatch at request "
-                    f"{begin + offset}: expected {row['question']!r}, "
-                    f"observed {str(query)!r}"
-                )
-        ids = [list(row["ids"]) for row in rows]
-        scores = [list(row["scores"]) for row in rows]
-        flat_ids = [document_id for request_ids in ids for document_id in request_ids]
-        flat_documents = load_documents(retriever.corpus, flat_ids)
-        topk = int(getattr(retriever, "topk", len(ids[0]) if ids else 0))
-        documents = [
-            flat_documents[offset : offset + topk]
-            for offset in range(0, len(flat_documents), topk)
-        ]
-        state["cursor"] = end
-        retriever.last_request_actions = ["replay"] * len(query_list)
-        return_score = bool(keywords.get("return_score", False))
-        return_idx = bool(keywords.get("return_idx", False))
-        if return_score and return_idx:
-            return documents, scores, ids
-        if return_score:
-            return documents, scores
-        if return_idx:
-            return documents, ids
-        return documents
-
-    retriever.batch_search = replay_batch_search
-    return state
-
-
 def source_order_prompt_fingerprints(dataset, tokenizer) -> dict[str, object]:
     """Fingerprint exact prompts and token IDs in original request order."""
 
@@ -1919,7 +1706,6 @@ def package_versions() -> dict[str, str]:
 
 async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
     sys.path.insert(0, str(PROJECT_ROOT))
-    sys.path.insert(0, str(PROJECT_ROOT / "examples/quick_start"))
     # Resolve the installed vLLM package before loading the index.
     if not (MNEMORAG_VLLM_ROOT / "vllm/__init__.py").is_file():
         raise RuntimeError(f"MnemoRAG vLLM runtime is incomplete: {MNEMORAG_VLLM_ROOT}")
@@ -1931,7 +1717,7 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         raise RuntimeError(
             f"Resolved vLLM outside the locked MnemoRAG runtime: {vllm_file}"
         )
-    from utils import poisson_persistent_workflow_run
+    from benchmarks.online_scheduler import poisson_persistent_workflow_run
 
     from mnemorag.config import Config
     from mnemorag.dataset.dataset import Dataset
@@ -1960,10 +1746,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             return doc_contents, doc_idxs
 
         DocumentPool.reorder_by_hotness = identity_reorder
-    if args.request_cycle_size < 0:
-        raise ValueError("request_cycle_size must be non-negative")
-    if args.arrival_trace is not None and args.request_cycle_size:
-        raise ValueError("--arrival-trace cannot be combined with --request-cycle-size")
     arrival_spec = ArrivalTraceSpec(
         request_count=args.num_requests,
         request_rate=args.arrival_rate,
@@ -1977,14 +1759,9 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
     if args.arrival_trace is not None:
         arrival_offsets, arrival_manifest = load_trace_bundle(args.arrival_trace)
         trace_sample_indices = load_trace_sample_indices(args.arrival_trace)
-    sample_count = (
-        min(args.num_requests, args.request_cycle_size)
-        if args.request_cycle_size
-        else args.num_requests
-    )
     rows, sample_indices, source_count = load_sample(
         DATASET_PATHS[args.dataset],
-        sample_count,
+        args.num_requests,
         args.seed,
         explicit_indices=trace_sample_indices,
     )
@@ -2010,14 +1787,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         overlap = set(warmup_sample_indices).intersection(sample_indices)
         if overlap:
             raise ValueError(f"online warmup overlaps {len(overlap)} measured rows")
-    if args.request_cycle_size:
-        rows = [
-            copy.deepcopy(rows[index % len(rows)]) for index in range(args.num_requests)
-        ]
-        sample_indices = [
-            sample_indices[index % len(sample_indices)]
-            for index in range(args.num_requests)
-        ]
     if args.arrival_trace is not None:
         validate_trace_workload(
             arrival_manifest,
@@ -2121,32 +1890,10 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
     page_cache_release = None
     preloaded_retriever = None
     retriever_preload_s = None
-    startup_reservation = getattr(args, "startup_gpu_reservation_handle", None)
-    if startup_reservation is not None and not args.drop_loaded_input_page_cache:
-        raise ValueError(
-            "--startup-gpu-reservation-mib requires "
-            "--drop-loaded-input-page-cache so the retriever is preloaded"
-        )
-    if args.drop_loaded_input_page_cache and (
-        args.cpu_kv_layout["enabled"] or startup_reservation is not None
-    ):
+    if args.drop_loaded_input_page_cache and args.cpu_kv_layout["enabled"]:
         preload_started = time.perf_counter()
         preloaded_retriever = get_retriever(config)
         retriever_preload_s = time.perf_counter() - preload_started
-        if startup_reservation is not None:
-            import torch
-
-            handoff_mib = torch.cuda.memory_reserved() / 1024**2
-            startup_reservation["report"]["handoff_parent_reserved_mib"] = handoff_mib
-            if handoff_mib <= MIN_GPU_RESERVATION_HANDOFF_MIB:
-                raise RuntimeError(
-                    "Retriever did not acquire enough GPU memory before "
-                    "startup reservation release: "
-                    f"{handoff_mib:.3f} MiB"
-                )
-            args.startup_gpu_reservation_report = release_startup_gpu_reservation(
-                startup_reservation
-            )
         page_cache_release = release_loaded_input_page_cache(
             [Path(config["index_path"]), Path(config["corpus_path"])]
         )
@@ -2925,7 +2672,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
             }
         ),
         "num_requests": args.num_requests,
-        "request_cycle_size": args.request_cycle_size,
         "arrival_rate_rps": args.arrival_rate,
         "arrival_burstiness": args.arrival_burstiness,
         "normalize_arrival_trace": args.normalize_arrival_trace,
@@ -2959,9 +2705,6 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
         "retriever_preloaded_before_generator": preloaded_retriever is not None,
         "retriever_preloaded_before_cpu_kv": bool(
             args.cpu_kv_layout["enabled"] and preloaded_retriever is not None
-        ),
-        "startup_gpu_reservation": getattr(
-            args, "startup_gpu_reservation_report", None
         ),
         "stage_record_artifacts": stage_record_artifacts,
         "request_metrics_artifact": {
@@ -3509,26 +3252,19 @@ async def run(args: argparse.Namespace, selected_cpus: list[int]) -> dict:
 def main() -> None:
     args = parse_args()
     selected_cpus = configure_resources(args)
-    reservation = start_startup_gpu_reservation(args.startup_gpu_reservation_mib)
-    args.startup_gpu_reservation_handle = reservation
+    monitor = RuntimeResourceMonitor(
+        selected_cpus,
+        args.gpu_id,
+        require_clean=args.require_clean_resources,
+        max_external_cpu_busy_percent=(args.max_runtime_external_cpu_busy_percent),
+        sample_interval_s=args.runtime_resource_sample_seconds,
+    )
+    args.runtime_resource_monitor = monitor
+    monitor.start()
     try:
-        monitor = RuntimeResourceMonitor(
-            selected_cpus,
-            args.gpu_id,
-            require_clean=args.require_clean_resources,
-            max_external_cpu_busy_percent=(args.max_runtime_external_cpu_busy_percent),
-            sample_interval_s=args.runtime_resource_sample_seconds,
-        )
-        args.runtime_resource_monitor = monitor
-        monitor.start()
-        try:
-            asyncio.run(run(args, selected_cpus))
-        finally:
-            monitor.stop()
+        asyncio.run(run(args, selected_cpus))
     finally:
-        args.startup_gpu_reservation_report = release_startup_gpu_reservation(
-            reservation
-        )
+        monitor.stop()
 
 
 if __name__ == "__main__":

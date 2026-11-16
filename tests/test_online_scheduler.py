@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from examples.quick_start.utils import poisson_persistent_workflow_run
+from benchmarks.online_scheduler import poisson_persistent_workflow_run
 from mnemorag.dataset.dataset import Dataset
 
 

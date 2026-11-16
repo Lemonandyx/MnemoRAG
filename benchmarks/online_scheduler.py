@@ -7,44 +7,8 @@ import time
 
 import numpy as np
 
+from benchmarks.fair_workload import ArrivalTraceSpec, build_arrival_offsets
 from mnemorag.dataset.dataset import Dataset
-
-
-def build_online_arrival_offsets(
-    request_count,
-    request_rate,
-    *,
-    burstiness=1.0,
-    random_seed=0,
-    normalize_duration=True,
-):
-    """Return finite vLLM-style arrival offsets for an open-loop workload."""
-    request_count = int(request_count)
-    request_rate = float(request_rate)
-    burstiness = float(burstiness)
-    if request_count < 0:
-        raise ValueError("request_count must be nonnegative")
-    if request_count == 0:
-        return np.asarray([], dtype=float)
-    if request_rate <= 0:
-        raise ValueError("request_rate must be positive")
-    if burstiness <= 0:
-        raise ValueError("burstiness must be positive")
-    if np.isinf(request_rate):
-        return np.zeros(request_count, dtype=float)
-    if np.isinf(burstiness):
-        intervals = np.full(request_count, 1.0 / request_rate, dtype=float)
-    else:
-        rng = np.random.default_rng(random_seed)
-        intervals = rng.gamma(
-            shape=burstiness,
-            scale=1.0 / (request_rate * burstiness),
-            size=request_count,
-        )
-    offsets = np.cumsum(intervals)
-    if normalize_duration and offsets[-1] > 0:
-        offsets *= (request_count / request_rate) / offsets[-1]
-    return offsets
 
 
 async def poisson_persistent_workflow_run(
@@ -63,13 +27,10 @@ async def poisson_persistent_workflow_run(
 ):
     """Run One-Pass, IRG, or RECOMP with open-loop arrivals."""
     workflow_name = str(workflow).strip().upper()
-    recomp_runner = getattr(pipeline, "run_stream_recomp", None)
-    if recomp_runner is None:
-        recomp_runner = pipeline.run_stream_dc
     workflow_runners = {
         "ONEPASS": pipeline.run_stream,
         "IRG": pipeline.run_stream_irg,
-        "RECOMP": recomp_runner,
+        "RECOMP": pipeline.run_stream_recomp,
     }
     if workflow_name not in workflow_runners:
         raise ValueError(
@@ -95,12 +56,14 @@ async def poisson_persistent_workflow_run(
     actual_arrival_offsets = [None] * total_n
     run_origin = time.perf_counter()
     if arrival_offsets is None:
-        scheduled_arrivals = build_online_arrival_offsets(
-            total_n,
-            arrival_rate,
-            burstiness=arrival_burstiness,
-            random_seed=random_seed,
-            normalize_duration=normalize_arrival_trace,
+        scheduled_arrivals = build_arrival_offsets(
+            ArrivalTraceSpec(
+                request_count=total_n,
+                request_rate=arrival_rate,
+                burstiness=arrival_burstiness,
+                random_seed=random_seed,
+                normalize_duration=normalize_arrival_trace,
+            )
         )
         arrival_trace_source = "generated"
         arrival_trace_normalized = bool(normalize_arrival_trace)

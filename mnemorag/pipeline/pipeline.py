@@ -1844,11 +1844,3 @@ class AsyncPipeline(BasicPipeline):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*generation_tasks, return_exceptions=True)
-
-    async def run_stream_dc(self, dataset, do_eval=True, pred_process_fun=None):
-        """Backward-compatible alias for the RECOMP workflow."""
-        return await self.run_stream_recomp(
-            dataset,
-            do_eval=do_eval,
-            pred_process_fun=pred_process_fun,
-        )
