@@ -1,0 +1,11 @@
+CUDA_VISIBLE_DEVICES=0 python -m mnemorag.retriever.index_builder \
+    --retrieval_method e5 \
+    --model_path /data/models/e5-large-v2 \
+    --corpus_path indexes/wiki18_2100w.jsonl \
+    --save_dir indexes/wiki18_2100w \
+    --use_fp16 \
+    --max_length 512 \
+    --batch_size 8 \
+    --pooling_method mean \
+    --faiss_type IVF4096,Flat \
+    --save_embedding

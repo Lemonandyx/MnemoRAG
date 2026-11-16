@@ -75,6 +75,8 @@ export GPTCACHE_PYTHON=/path/to/gptcache/python # baseline comparisons only
 Experiment settings are in [`configs/paper_a100.json`](configs/paper_a100.json).
 See [`benchmarks/README.md`](benchmarks/README.md) for the asset layout.
 
+For index-building options, run `python -m mnemorag.retriever.index_builder --help`.
+
 ## Quick start
 
 Run a short NQ example with the configured assets:
