@@ -6,14 +6,9 @@
 
 MnemoRAG is a RAG serving system that converts correlations across requests into
 lower retrieval, prefill, and scheduling overhead. It combines similarity-aware
-retrieval, hotness-driven prefix caching, and asynchronous cross-request
-execution while preserving each request's retrieval-before-generation
-dependency.
+retrieval, hotness-driven prefix caching, and asynchronous RAG scheduling.
 
 **[Read the latest paper](paper/MnemoRAG.pdf)**
-
-The paper-to-code asynchronous execution contract is documented in
-[`ASYNC_DESIGN.md`](ASYNC_DESIGN.md).
 
 ## Overview
 
@@ -28,11 +23,6 @@ MnemoRAG integrates three complementary mechanisms:
   every request in the current microbatch is admitted to prefill, then overlaps
   CPU search, GPU query matching, KV restoration, prefill, and decoding with
   one bounded look-ahead microbatch.
-
-The artifact contains the current runtime, a sparse vLLM overlay, controlled
-benchmark entry points, paper plotting programs, verification tests, and the
-latest paper. Models, corpora, indexes, request traces, and experimental result
-tables are intentionally excluded.
 
 ## Repository layout
 
@@ -100,8 +90,7 @@ export GPTCACHE_PYTHON=/path/to/gptcache/python # baseline comparisons only
 ```
 
 The expected asset layout and the cross-system evaluation contract are
-documented in [`benchmarks/README.md`](benchmarks/README.md). No dataset, model,
-corpus, or index is downloaded automatically.
+documented in [`benchmarks/README.md`](benchmarks/README.md).
 
 ## Quick start
 
@@ -144,10 +133,6 @@ python -m benchmarks.run_mnemo_ablation --help
 
 ```
 
-Every formal point starts a fresh serving process. Workload manifests record
-request identities, arrival traces, source hashes, runtime contracts, and
-resource checks. Raw outputs belong under `results/`, which is ignored by Git.
-
 ## Reproducing figures
 
 Plotting programs are organized by claim under [`figures/`](figures/). The
@@ -158,8 +143,7 @@ python figures/end_to_end/plot.py --input /path/to/end_to_end.csv
 python figures/component_ablation/plot.py --input /path/to/component_ablation.csv
 ```
 
-The programs emit PNG and PDF files under `output/`. Experimental tables are
-not distributed with the source release.
+The programs export PNG and PDF files.
 
 ## Verification
 

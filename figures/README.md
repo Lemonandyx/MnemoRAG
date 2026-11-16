@@ -1,12 +1,7 @@
 # Plotting programs
 
-This directory contains plotting code only. It does not contain measurements,
-request traces, aggregate result tables, model outputs, or dataset samples.
-
-Each program reads an external CSV or a directory of result summaries and
-writes PNG and PDF files below an ignored output directory. Dataset names,
-series labels, panel counts, and axis ranges are derived from the supplied
-input wherever possible.
+Plotting programs for the MnemoRAG paper. Each program reads a CSV or a
+directory of result summaries and exports PNG and PDF files.
 
 ```bash
 python figures/end_to_end/plot.py --input /path/to/table.csv
@@ -16,6 +11,3 @@ python figures/motivation/plot_hotness.py --source-csv /path/to/table.csv \
 python figures/retrieval_cache/plot.py /path/to/summaries \
   --dataset dataset_name --output output/retrieval
 ```
-
-The repository intentionally excludes the inputs used to render manuscript
-figures.

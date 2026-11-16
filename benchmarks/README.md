@@ -1,8 +1,6 @@
 # Benchmarks
 
-This directory contains the public evaluation entry points used by the latest
-MnemoRAG manuscript. Raw measurements, request traces, model outputs, local
-resource paths, and exploratory utilities are not part of the source release.
+Entry points for the experiments in the MnemoRAG paper.
 
 ## Environment
 
@@ -15,9 +13,7 @@ export HEDRARAG_ROOT=/path/to/HedraRAG
 ```
 
 The expected asset root contains the embedding model, generation model,
-datasets, Wikipedia corpus, and IVF index described in the paper. Every formal
-point starts in a fresh process and writes its output below an ignored
-`results/` directory.
+datasets, Wikipedia corpus, and IVF index described in the paper.
 
 ## Public entry points
 
@@ -36,6 +32,5 @@ python -m benchmarks.run_retrieval_six_system_four_dataset --help
 python -m benchmarks.run_mnemo_ablation --help
 ```
 
-Supporting modules implement shared workload construction, resource checks,
-runtime validation, and baseline adapters. They are imported by the public
-entry points and are not separate experimental programs.
+Supporting modules provide workload generation, evaluation utilities, and
+baseline adapters.
